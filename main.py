@@ -35,7 +35,6 @@ class Database:
                 file_id TEXT,
                 title TEXT,
                 view_count INTEGER DEFAULT 0,
-                save_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -54,14 +53,6 @@ class Database:
                 user_id INTEGER,
                 video_key TEXT,
                 viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS user_saves (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                video_key TEXT,
-                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         self.conn.execute('''
@@ -88,48 +79,23 @@ class Database:
             return False
     
     def get_video(self, unique_key):
-        cursor = self.conn.execute('SELECT file_id, title, view_count, save_count FROM videos WHERE unique_key = ?', (unique_key,))
+        cursor = self.conn.execute('SELECT file_id, title, view_count FROM videos WHERE unique_key = ?', (unique_key,))
         result = cursor.fetchone()
         if result:
             return {
                 'file_id': result[0], 
                 'title': result[1], 
-                'view_count': result[2],
-                'save_count': result[3]
+                'view_count': result[2]
             }
         return None
+    
+    def get_all_videos(self):
+        cursor = self.conn.execute('SELECT unique_key, title, view_count FROM videos ORDER BY created_at DESC')
+        return cursor.fetchall()
     
     def increment_view_count(self, unique_key):
         self.conn.execute('UPDATE videos SET view_count = view_count + 1 WHERE unique_key = ?', (unique_key,))
         self.conn.commit()
-    
-    def increment_save_count(self, unique_key):
-        self.conn.execute('UPDATE videos SET save_count = save_count + 1 WHERE unique_key = ?', (unique_key,))
-        self.conn.commit()
-    
-    def get_video_stats(self):
-        cursor = self.conn.execute('''
-            SELECT COUNT(*) as total_videos, SUM(view_count) as total_views, SUM(save_count) as total_saves 
-            FROM videos
-        ''')
-        result = cursor.fetchone()
-        return {
-            'total_videos': result[0] or 0,
-            'total_views': result[1] or 0,
-            'total_saves': result[2] or 0
-        }
-    
-    def get_user_stats(self):
-        cursor = self.conn.execute('SELECT COUNT(*) FROM users')
-        total_users = cursor.fetchone()[0]
-        
-        cursor = self.conn.execute('SELECT COUNT(DISTINCT user_id) FROM user_views WHERE viewed_at > datetime("now", "-1 day")')
-        daily_users = cursor.fetchone()[0]
-        
-        return {
-            'total_users': total_users,
-            'daily_users': daily_users
-        }
     
     def update_user(self, user_id, username="", first_name=""):
         self.conn.execute(
@@ -144,10 +110,6 @@ class Database:
     
     def record_user_view(self, user_id, video_key):
         self.conn.execute('INSERT INTO user_views (user_id, video_key) VALUES (?, ?)', (user_id, video_key))
-        self.conn.commit()
-    
-    def record_user_save(self, user_id, video_key):
-        self.conn.execute('INSERT INTO user_saves (user_id, video_key) VALUES (?, ?)', (user_id, video_key))
         self.conn.commit()
     
     def save_sent_message(self, user_id, message_id, video_key):
@@ -178,7 +140,6 @@ def create_join_keyboard(video_key=None):
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار ربات", callback_data="stats")],
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
     ])
 
@@ -250,8 +211,6 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
         
         file_id = video_data['file_id']
         title = video_data['title'] or "فایل شما"
-        view_count = video_data['view_count']
-        save_count = video_data['save_count']
         
         # پیام هشدار
         warning_message = await context.bot.send_message(
@@ -261,11 +220,9 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
             parse_mode='Markdown'
         )
         
-        # ارسال فایل با کپشن (بدون دکمه‌های اضافی)
+        # ارسال فایل با کپشن ساده (بدون آمار)
         caption = (
-            f"🎬 **{title}**\n"
-            f"🔑 کد: `{video_key}`\n\n"
-            f"📊 **آمار:** 👁️ {view_count} بازدید | 💾 {save_count} ذخیره\n\n"
+            f"🎬 **{title}**\n\n"
             f"⏰ این فایل 30 ثانیه دیگر حذف می‌شود!\n"
             f"💾 برای استفاده بعدی، حتماً ذخیره کنید."
         )
@@ -276,7 +233,6 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
                 file_id, 
                 caption=caption,
                 parse_mode='Markdown'
-                # بدون reply_markup - هیچ دکمه‌ای نمایش داده نمی‌شود
             )
         except BadRequest:
             sent_message = await context.bot.send_document(
@@ -284,7 +240,6 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
                 file_id,
                 caption=caption,
                 parse_mode='Markdown'
-                # بدون reply_markup - هیچ دکمه‌ای نمایش داده نمی‌شود
             )
         
         # ذخیره اطلاعات پیام برای حذف خودکار
@@ -412,28 +367,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=create_join_keyboard(video_key)
             )
     
-    elif data == "stats":
-        # جمع‌آوری آمار
-        video_stats = db.get_video_stats()
-        user_stats = db.get_user_stats()
-        
-        stats_text = (
-            f"📊 **آمار واقعی ربات**\n\n"
-            f"🎬 **تعداد ویدیوها:** {video_stats['total_videos']}\n"
-            f"👁️ **تعداد کل بازدیدها:** {video_stats['total_views']}\n"
-            f"💾 **تعداد کل ذخیره‌ها:** {video_stats['total_saves']}\n\n"
-            f"👥 **کاربران کل:** {user_stats['total_users']}\n"
-            f"📈 **کاربران امروز:** {user_stats['daily_users']}\n\n"
-            f"⏰ **سیستم حذف خودکار:** فعال (30 ثانیه)\n"
-            f"🔒 **سیستم چک عضویت:** فعال"
-        )
-        
-        await query.edit_message_text(
-            stats_text,
-            parse_mode='Markdown',
-            reply_markup=get_main_keyboard()
-        )
-    
     elif data == "help":
         await query.edit_message_text(
             "📖 **راهنمای ربات:**\n\n"
@@ -472,25 +405,28 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         return
     
+    # ایجاد یک کد ثابت برای هر فایل بر اساس محتوای آن
     unique_key = generate_key()
     
     if db.add_video(unique_key, file_id, title):
-        link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
+        # لینک ثابت برای این فایل
+        permanent_link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
         
         try:
             await context.bot.send_message(
                 ADMIN_ID,
                 f"📦 **فایل جدید ذخیره شد!**\n\n"
                 f"📁 نوع: {file_type}\n"
-                f"🔑 کد: `{unique_key}`\n"
+                f"🔑 کد ثابت: `{unique_key}`\n"
                 f"📝 عنوان: {title}\n"
-                f"🔗 لینک:\n`{link}`",
+                f"🔗 لینک ثابت:\n`{permanent_link}`\n\n"
+                f"💡 این لینک همیشگی است و منقضی نمی‌شود",
                 parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=link)
+                    InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=permanent_link)
                 ]])
             )
-            logging.info(f"✅ فایل جدید با کد {unique_key} ذخیره شد")
+            logging.info(f"✅ فایل جدید با کد ثابت {unique_key} ذخیره شد")
         except Exception as e:
             logging.error(f"❌ خطا در ارسال به ادمین: {e}")
 
@@ -503,35 +439,50 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # جمع‌آوری آمار کامل
-    video_stats = db.get_video_stats()
-    user_stats = db.get_user_stats()
+    videos = db.get_all_videos()
     
-    # محبوب‌ترین ویدیوها
-    cursor = db.conn.execute('''
-        SELECT unique_key, title, view_count, save_count 
-        FROM videos 
-        ORDER BY view_count DESC 
-        LIMIT 5
-    ''')
-    top_videos = cursor.fetchall()
+    stats_text = "📊 **آمار کامل ادمین**\n\n"
+    stats_text += f"🎬 **تعداد کل ویدیوها:** {len(videos)}\n\n"
     
-    stats_text = (
-        f"📊 **آمار کامل ادمین**\n\n"
-        f"🎬 **ویدیوها:**\n"
-        f"• کل ویدیوها: {video_stats['total_videos']}\n"
-        f"• کل بازدیدها: {video_stats['total_views']}\n"
-        f"• کل ذخیره‌ها: {video_stats['total_saves']}\n\n"
-        f"👥 **کاربران:**\n"
-        f"• کاربران کل: {user_stats['total_users']}\n"
-        f"• کاربران امروز: {user_stats['daily_users']}\n\n"
-        f"🏆 **پربازدیدترین ویدیوها:**\n"
-    )
+    total_views = 0
+    for unique_key, title, view_count in videos:
+        total_views += view_count
+        stats_text += f"• {title[:30]}... - {view_count} بازدید\n"
+        stats_text += f"  🔗 `https://t.me/{BOT_USERNAME}?start=video_{unique_key}`\n\n"
     
-    for i, (key, title, views, saves) in enumerate(top_videos, 1):
-        save_rate = round((saves / views) * 100, 1) if views > 0 else 0
-        stats_text += f"{i}. {title[:20]}... - {views} بازدید / {saves} ذخیره ({save_rate}%)\n"
+    stats_text += f"👁️ **تعداد کل بازدیدها:** {total_views}"
     
     await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لیست تمام ویدیوها با لینک‌های ثابت"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
+        return
+    
+    videos = db.get_all_videos()
+    
+    if not videos:
+        await update.message.reply_text("📭 هیچ فایلی در دیتابیس وجود ندارد.")
+        return
+    
+    message_text = "📋 **لیست فایل‌ها با لینک‌های ثابت:**\n\n"
+    
+    for i, (unique_key, title, view_count) in enumerate(videos, 1):
+        permanent_link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
+        message_text += f"{i}. **{title}**\n"
+        message_text += f"   👁️ {view_count} بازدید\n"
+        message_text += f"   🔗 `{permanent_link}`\n\n"
+    
+    # اگر متن طولانی شد، آن را به چند قسمت تقسیم کن
+    if len(message_text) > 4000:
+        parts = [message_text[i:i+4000] for i in range(0, len(message_text), 4000)]
+        for part in parts:
+            await update.message.reply_text(part, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(message_text, parse_mode='Markdown')
 
 async def manual_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دستور برای تأیید دستی کاربر"""
@@ -577,6 +528,7 @@ def main():
     # هندلرها
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("list", list_videos))
     app.add_handler(CommandHandler("approve", manual_approve_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     
