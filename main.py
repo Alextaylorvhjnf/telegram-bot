@@ -15,7 +15,7 @@ from telegram.ext import (
 # ----------------------- CONFIG -----------------------
 TOKEN = "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0"
 BOT_USERNAME = "Senderpfilesbot"
-FORCE_CHANNEL_ID = -1002034901903
+FORCE_CHANNEL_ID = -1002920455639
 CHANNEL_LINK = "https://t.me/betdesignernet"
 ADMIN_ID = 7321524568
 
