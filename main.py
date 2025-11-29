@@ -4,7 +4,7 @@ import sqlite3
 import secrets
 import string
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
@@ -34,24 +34,34 @@ class Database:
                 unique_key TEXT UNIQUE,
                 file_id TEXT,
                 title TEXT,
+                view_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         self.conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                joined BOOLEAN DEFAULT FALSE,
                 username TEXT,
                 first_name TEXT,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_downloads INTEGER DEFAULT 0
             )
         ''')
         self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS pending_requests (
+            CREATE TABLE IF NOT EXISTS user_views (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 video_key TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, video_key)
+                viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS sent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message_id INTEGER,
+                video_key TEXT,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         self.conn.commit()
@@ -69,42 +79,65 @@ class Database:
             return False
     
     def get_video(self, unique_key):
-        cursor = self.conn.execute('SELECT file_id, title FROM videos WHERE unique_key = ?', (unique_key,))
+        cursor = self.conn.execute('SELECT file_id, title, view_count FROM videos WHERE unique_key = ?', (unique_key,))
         result = cursor.fetchone()
         if result:
-            return {'file_id': result[0], 'title': result[1]}
+            return {'file_id': result[0], 'title': result[1], 'view_count': result[2]}
         return None
     
-    def set_user_joined(self, user_id, username="", first_name=""):
+    def increment_view_count(self, unique_key):
+        self.conn.execute('UPDATE videos SET view_count = view_count + 1 WHERE unique_key = ?', (unique_key,))
+        self.conn.commit()
+    
+    def get_video_stats(self):
+        cursor = self.conn.execute('''
+            SELECT COUNT(*) as total_videos, SUM(view_count) as total_views 
+            FROM videos
+        ''')
+        result = cursor.fetchone()
+        return {
+            'total_videos': result[0] or 0,
+            'total_views': result[1] or 0
+        }
+    
+    def get_user_stats(self):
+        cursor = self.conn.execute('SELECT COUNT(*) FROM users')
+        total_users = cursor.fetchone()[0]
+        
+        cursor = self.conn.execute('SELECT COUNT(DISTINCT user_id) FROM user_views WHERE viewed_at > datetime("now", "-1 day")')
+        daily_users = cursor.fetchone()[0]
+        
+        return {
+            'total_users': total_users,
+            'daily_users': daily_users
+        }
+    
+    def update_user(self, user_id, username="", first_name=""):
         self.conn.execute(
-            'INSERT OR REPLACE INTO users (user_id, joined, username, first_name) VALUES (?, ?, ?, ?)', 
-            (user_id, True, username, first_name)
+            'INSERT OR REPLACE INTO users (user_id, username, first_name, last_seen) VALUES (?, ?, ?, CURRENT_TIMESTAMP)', 
+            (user_id, username, first_name)
         )
         self.conn.commit()
-        logging.info(f"✅ کاربر {user_id} به عنوان عضو ثبت شد")
     
-    def has_user_joined(self, user_id):
-        cursor = self.conn.execute('SELECT joined FROM users WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
-        return result[0] if result else False
+    def increment_user_downloads(self, user_id):
+        self.conn.execute('UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?', (user_id,))
+        self.conn.commit()
     
-    def add_pending_request(self, user_id, video_key):
-        try:
-            self.conn.execute(
-                'INSERT OR REPLACE INTO pending_requests (user_id, video_key) VALUES (?, ?)',
-                (user_id, video_key)
-            )
-            self.conn.commit()
-            return True
-        except:
-            return False
+    def record_user_view(self, user_id, video_key):
+        self.conn.execute('INSERT INTO user_views (user_id, video_key) VALUES (?, ?)', (user_id, video_key))
+        self.conn.commit()
     
-    def get_pending_requests(self, user_id):
-        cursor = self.conn.execute('SELECT video_key FROM pending_requests WHERE user_id = ?', (user_id,))
-        return [row[0] for row in cursor.fetchall()]
+    def save_sent_message(self, user_id, message_id, video_key):
+        self.conn.execute('INSERT INTO sent_messages (user_id, message_id, video_key) VALUES (?, ?, ?)', 
+                         (user_id, message_id, video_key))
+        self.conn.commit()
     
-    def remove_pending_request(self, user_id, video_key):
-        self.conn.execute('DELETE FROM pending_requests WHERE user_id = ? AND video_key = ?', (user_id, video_key))
+    def get_sent_messages(self):
+        cursor = self.conn.execute('SELECT id, user_id, message_id, video_key FROM sent_messages')
+        return cursor.fetchall()
+    
+    def delete_sent_message(self, message_id):
+        self.conn.execute('DELETE FROM sent_messages WHERE message_id = ?', (message_id,))
         self.conn.commit()
 
 db = Database()
@@ -122,7 +155,7 @@ def create_join_keyboard(video_key=None):
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار", callback_data="stats")],
+        [InlineKeyboardButton("📊 آمار ربات", callback_data="stats")],
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
     ])
 
@@ -152,6 +185,34 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
         logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت: {e}")
         return False
 
+# ==================== حذف خودکار پیام‌ها ====================
+async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE):
+    """حذف خودکار پیام‌های ارسال شده بعد از 30 ثانیه"""
+    try:
+        sent_messages = db.get_sent_messages()
+        current_time = datetime.now()
+        
+        for msg_id, user_id, message_id, video_key in sent_messages:
+            try:
+                # حذف پیام از چت کاربر
+                await context.bot.delete_message(chat_id=user_id, message_id=message_id)
+                logging.info(f"✅ پیام {message_id} برای کاربر {user_id} حذف شد")
+                
+                # حذف از دیتابیس
+                db.delete_sent_message(message_id)
+                
+            except BadRequest as e:
+                if "Message to delete not found" in str(e):
+                    logging.info(f"⚠️ پیام {message_id} قبلاً حذف شده")
+                    db.delete_sent_message(message_id)
+                else:
+                    logging.error(f"❌ خطا در حذف پیام {message_id}: {e}")
+            except Exception as e:
+                logging.error(f"❌ خطای غیرمنتظره در حذف پیام: {e}")
+                
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف خودکار پیام‌ها: {e}")
+
 # ==================== ارسال فایل به کاربر ====================
 async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
     try:
@@ -167,31 +228,65 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
         file_id = video_data['file_id']
         title = video_data['title'] or "فایل شما"
         
-        # ارسال فایل
+        # پیام هشدار
+        warning_message = await context.bot.send_message(
+            user_id,
+            "⚠️ **توجه**: این فایل 30 ثانیه دیگر به طور خودکار حذف خواهد شد.\n"
+            "💾 بهتر است آن را ذخیره کنید!",
+            parse_mode='Markdown'
+        )
+        
+        # ارسال فایل با کپشن
+        caption = (
+            f"🎬 **{title}**\n"
+            f"🔑 کد: `{video_key}`\n\n"
+            f"⏰ این فایل 30 ثانیه دیگر حذف می‌شود!\n"
+            f"💾 برای استفاده بعدی، حتماً ذخیره کنید."
+        )
+        
         try:
-            await context.bot.send_video(
+            sent_message = await context.bot.send_video(
                 user_id, 
                 file_id, 
-                caption=f"🎬 {title}\n🔑 کد: {video_key}",
+                caption=caption,
+                parse_mode='Markdown',
                 reply_markup=get_main_keyboard()
             )
         except BadRequest:
-            await context.bot.send_document(
+            sent_message = await context.bot.send_document(
                 user_id,
                 file_id,
-                caption=f"📁 {title}\n🔑 کد: {video_key}",
+                caption=caption,
+                parse_mode='Markdown',
                 reply_markup=get_main_keyboard()
             )
         
-        success_text = "✅ فایل با موفقیت ارسال شد!"
+        # ذخیره اطلاعات پیام برای حذف خودکار
+        db.save_sent_message(user_id, sent_message.message_id, video_key)
+        db.save_sent_message(user_id, warning_message.message_id, video_key)
+        
+        # به‌روزرسانی آمار
+        db.increment_view_count(video_key)
+        db.increment_user_downloads(user_id)
+        db.record_user_view(user_id, video_key)
+        
+        success_text = "✅ فایل با موفقیت ارسال شد!\n⚠️ یادت نره ذخیره‌اش کنی، 30 ثانیه دیگه حذف میشه!"
         if message_to_edit:
             await message_to_edit.edit_text(success_text)
         else:
             await context.bot.send_message(user_id, success_text)
         
-        # ثبت کاربر به عنوان عضو و حذف درخواست در انتظار
-        db.set_user_joined(user_id)
-        db.remove_pending_request(user_id, video_key)
+        # برنامه‌ریزی حذف خودکار بعد از 30 ثانیه
+        await asyncio.sleep(30)
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=sent_message.message_id)
+            await context.bot.delete_message(chat_id=user_id, message_id=warning_message.message_id)
+            db.delete_sent_message(sent_message.message_id)
+            db.delete_sent_message(warning_message.message_id)
+            logging.info(f"✅ فایل {video_key} برای کاربر {user_id} بعد از 30 ثانیه حذف شد")
+        except Exception as e:
+            logging.error(f"❌ خطا در حذف خودکار فایل: {e}")
+        
         logging.info(f"✅ فایل {video_key} برای کاربر {user_id} ارسال شد")
         
     except Exception as e:
@@ -209,6 +304,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"🚀 کاربر {user_id} دستور /start را اجرا کرد")
     
+    # به‌روزرسانی اطلاعات کاربر
+    db.update_user(user_id, user.username, user.first_name)
+    
     # اگر آرگومان دارد (یعنی از لینک آمده)
     if context.args:
         start_arg = context.args[0]
@@ -225,29 +323,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # اگر کاربر قبلاً عضو شده
-            if db.has_user_joined(user_id):
-                logging.info(f"✅ کاربر {user_id} قبلاً عضو شده، ارسال فایل")
+            # بررسی عضویت کاربر
+            is_member = await check_membership(user_id, context)
+            
+            if is_member:
+                logging.info(f"✅ کاربر {user_id} عضو است، ارسال فایل")
                 await send_video_to_user(context, user_id, video_key)
-                return
-            
-            # ذخیره درخواست در انتظار
-            db.add_pending_request(user_id, video_key)
-            
-            # نمایش پیام عضویت
-            await update.message.reply_text(
-                f"🔒 برای دریافت فایل، لطفاً در کانال ما عضو شوید:\n\n"
-                f"📢 {CHANNEL_USERNAME}\n\n"
-                f"✅ پس از عضویت، روی دکمه زیر کلیک کنید:",
-                reply_markup=create_join_keyboard(video_key)
-            )
+            else:
+                # نمایش پیام عضویت
+                await update.message.reply_text(
+                    f"🔒 برای دریافت فایل، لطفاً در کانال ما عضو شوید:\n\n"
+                    f"📢 {CHANNEL_USERNAME}\n\n"
+                    f"✅ پس از عضویت، روی دکمه زیر کلیک کنید:\n\n"
+                    f"⚠️ توجه: اگر از کانال لفت بدید، فایل‌های بعدی براتون ارسال نمیشه!",
+                    reply_markup=create_join_keyboard(video_key)
+                )
     else:
         # پیام خوشامدگویی معمولی
         await update.message.reply_text(
             f"سلام {user.first_name}! 🤖\n\n"
             f"به ربات دریافت فایل خوش آمدید.\n\n"
             f"🎬 برای دریافت فایل روی لینک مخصوص کلیک کنید.\n"
-            f"📢 کانال: {CHANNEL_USERNAME}",
+            f"📢 کانال: {CHANNEL_USERNAME}\n\n"
+            f"⚠️ توجه: فایل‌ها 30 ثانیه پس از ارسال به طور خودکار حذف می‌شوند!",
             reply_markup=get_main_keyboard()
         )
 
@@ -265,12 +363,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_key = data.split("_", 1)[1] if "_" in data else None
         
         if not video_key:
-            # اگر video_key وجود ندارد، از pending_requests بگیر
-            pending_requests = db.get_pending_requests(user_id)
-            if pending_requests:
-                video_key = pending_requests[0]
-        
-        if not video_key:
             await query.edit_message_text("❌ لینک معتبر نیست.")
             return
         
@@ -282,7 +374,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if is_member:
             await query.edit_message_text("✅ عضویت شما تأیید شد!\n\nدر حال ارسال فایل...")
-            db.set_user_joined(user_id)
             await send_video_to_user(context, user_id, video_key, query.message)
         else:
             await query.edit_message_text(
@@ -290,28 +381,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"لطفاً مطمئن شوید:\n"
                 f"• در کانال {CHANNEL_USERNAME} عضو شده‌اید\n"
                 f"• از اکانت درست استفاده می‌کنید\n\n"
-                f"اگر مشکل ادامه دارد، با ادمین تماس بگیرید.",
+                f"⚠️ اگر از کانال لفت بدید، فایل‌های بعدی براتون ارسال نمیشه!\n\n"
+                f"🔗 لینک کانال: {FORCE_CHANNEL_LINK}",
                 reply_markup=create_join_keyboard(video_key)
             )
     
     elif data == "stats":
+        # جمع‌آوری آمار
+        video_stats = db.get_video_stats()
+        user_stats = db.get_user_stats()
+        
+        stats_text = (
+            f"📊 **آمار واقعی ربات**\n\n"
+            f"🎬 **تعداد ویدیوها:** {video_stats['total_videos']}\n"
+            f"👁️ **تعداد کل بازدیدها:** {video_stats['total_views']}\n"
+            f"👥 **کاربران کل:** {user_stats['total_users']}\n"
+            f"📈 **کاربران امروز:** {user_stats['daily_users']}\n\n"
+            f"⏰ **سیستم حذف خودکار:** فعال (30 ثانیه)\n"
+            f"🔒 **سیستم چک عضویت:** فعال"
+        )
+        
         await query.edit_message_text(
-            f"📊 آمار ربات:\n\n"
-            f"🤖 وضعیت: فعال\n"
-            f"🔗 کانال: {CHANNEL_USERNAME}\n"
-            f"👤 برای دریافت فایل از لینک استفاده کنید",
+            stats_text,
+            parse_mode='Markdown',
             reply_markup=get_main_keyboard()
         )
     
     elif data == "help":
         await query.edit_message_text(
-            "📖 راهنمای ربات:\n\n"
-            "🎬 روش دریافت فایل:\n"
+            "📖 **راهنمای ربات:**\n\n"
+            "🎬 **روش دریافت فایل:**\n"
             "1. روی لینک مخصوص فایل کلیک کنید\n"
             "2. در کانال عضو شوید\n"
             "3. روی دکمه تأیید عضویت کلیک کنید\n"
             "4. فایل دریافت می‌شود\n\n"
+            "⚠️ **توجه مهم:**\n"
+            "• فایل‌ها 30 ثانیه پس از ارسال حذف می‌شوند\n"
+            "• حتماً فایل را ذخیره کنید\n"
+            "• اگر از کانال لفت بدید، فایل دریافت نمی‌کنید\n\n"
             f"📢 کانال: {CHANNEL_USERNAME}",
+            parse_mode='Markdown',
             reply_markup=get_main_keyboard()
         )
 
@@ -344,11 +453,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await context.bot.send_message(
                 ADMIN_ID,
-                f"📦 فایل جدید ذخیره شد!\n\n"
+                f"📦 **فایل جدید ذخیره شد!**\n\n"
                 f"📁 نوع: {file_type}\n"
-                f"🔑 کد: {unique_key}\n"
+                f"🔑 کد: `{unique_key}`\n"
                 f"📝 عنوان: {title}\n"
-                f"🔗 لینک:\n{link}",
+                f"🔗 لینک:\n`{link}`",
+                parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=link)
                 ]])
@@ -358,26 +468,41 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             logging.error(f"❌ خطا در ارسال به ادمین: {e}")
 
 # ==================== دستورات ادمین ====================
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
-    # تست عضویت
-    result = await check_membership(user_id, context)
+    # جمع‌آوری آمار کامل
+    video_stats = db.get_video_stats()
+    user_stats = db.get_user_stats()
     
-    await update.message.reply_text(
-        f"🔍 تست عضویت:\n\n"
-        f"👤 کاربر: {user_id}\n"
-        f"📢 کانال ID: {FORCE_CHANNEL_ID}\n"
-        f"🔗 لینک: {FORCE_CHANNEL_LINK}\n\n"
-        f"✅ وضعیت عضویت: {result}\n\n"
-        f"💡 اگر False است:\n"
-        f"• مطمئن شوید ربات در کانال ادمین است\n"
-        f"• مطمئن شوید شما در کانال عضو هستید"
+    # محبوب‌ترین ویدیوها
+    cursor = db.conn.execute('''
+        SELECT unique_key, title, view_count 
+        FROM videos 
+        ORDER BY view_count DESC 
+        LIMIT 5
+    ''')
+    top_videos = cursor.fetchall()
+    
+    stats_text = (
+        f"📊 **آمار کامل ادمین**\n\n"
+        f"🎬 **ویدیوها:**\n"
+        f"• کل ویدیوها: {video_stats['total_videos']}\n"
+        f"• کل بازدیدها: {video_stats['total_views']}\n\n"
+        f"👥 **کاربران:**\n"
+        f"• کاربران کل: {user_stats['total_users']}\n"
+        f"• کاربران امروز: {user_stats['daily_users']}\n\n"
+        f"🏆 **پربازدیدترین ویدیوها:**\n"
     )
+    
+    for i, (key, title, views) in enumerate(top_videos, 1):
+        stats_text += f"{i}. {title[:20]}... - {views} بازدید\n"
+    
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
 
 async def manual_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دستور برای تأیید دستی کاربر"""
@@ -392,17 +517,20 @@ async def manual_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     try:
         target_user_id = int(context.args[0])
-        db.set_user_joined(target_user_id)
         
-        # ارسال تمام فایل‌های در انتظار
-        pending_requests = db.get_pending_requests(target_user_id)
-        for video_key in pending_requests:
-            await send_video_to_user(context, target_user_id, video_key)
+        # ارسال پیام تأیید
+        await context.bot.send_message(
+            target_user_id,
+            "✅ دسترسی شما توسط ادمین تأیید شد!\n\n"
+            "اکنون می‌توانید از لینک‌های فایل استفاده کنید."
+        )
         
-        await update.message.reply_text(f"✅ کاربر {target_user_id} تأیید شد و فایل‌ها ارسال شدند.")
+        await update.message.reply_text(f"✅ کاربر {target_user_id} تأیید شد.")
         
     except ValueError:
         await update.message.reply_text("❌ ID کاربر نامعتبر است.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در ارسال پیام: {e}")
 
 # ==================== اجرای ربات ====================
 def main():
@@ -419,7 +547,7 @@ def main():
     
     # هندلرها
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("test", test_cmd))
+    app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("approve", manual_approve_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     
@@ -428,6 +556,11 @@ def main():
         filters.ChatType.CHANNEL & (filters.VIDEO | filters.Document.ALL), 
         handle_channel_post
     ))
+    
+    # Job Queue برای حذف خودکار پیام‌های قدیمی
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(delete_old_messages, interval=60, first=10)  # هر 1 دقیقه چک کن
     
     logging.info("✅ ربات آماده است")
     app.run_polling(drop_pending_updates=True)
