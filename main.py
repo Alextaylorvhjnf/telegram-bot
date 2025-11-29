@@ -164,16 +164,40 @@ def get_main_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ==================== بررسی عضویت ====================
+# ==================== بررسی عضویت - نسخه اصلاح شده ====================
 async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    تابع بهبود یافته برای بررسی عضویت کاربر در کانال
+    """
     try:
+        # لاگ برای دیباگ
+        logging.info(f"🔍 بررسی عضویت کاربر {user_id} در کانال {FORCE_CHANNEL}")
+        
+        # بررسی با استفاده از get_chat_member
         member = await context.bot.get_chat_member(FORCE_CHANNEL, user_id)
-        return member.status in ["member", "administrator", "creator"]
+        
+        # لاگ وضعیت کاربر
+        logging.info(f"👤 وضعیت کاربر {user_id} در کانال: {member.status}")
+        
+        # بررسی وضعیت‌های مجاز
+        allowed_statuses = ["member", "administrator", "creator"]
+        is_member = member.status in allowed_statuses
+        
+        logging.info(f"✅ نتیجه بررسی عضویت کاربر {user_id}: {is_member}")
+        return is_member
+        
     except BadRequest as e:
-        logging.error(f"خطا در بررسی عضویت: {e}")
+        logging.error(f"❌ خطا در بررسی عضویت کاربر {user_id}: {e}")
+        # اگر کانال پیدا نشد یا ربات دسترسی ندارد
+        if "Chat not found" in str(e):
+            logging.error("❌ کانال پیدا نشد. مطمئن شوید ربات در کانال ادمین است")
+        elif "bot is not a member" in str(e):
+            logging.error("❌ ربات عضو کانال نیست")
+        elif "user not found" in str(e):
+            logging.error("❌ کاربر پیدا نشد")
         return False
     except Exception as e:
-        logging.error(f"خطای غیرمنتظره در بررسی عضویت: {e}")
+        logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت کاربر {user_id}: {e}")
         return False
 
 # ==================== هندلر پست کانال ====================
@@ -195,24 +219,27 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             
             # ارسال لینک به ادمین
             try:
+                file_size = message.video.file_size
+                size_text = f"{file_size // (1024*1024)} مگابایت" if file_size else "نامشخص"
+                
                 await context.bot.send_message(
                     ADMIN_ID,
                     f"🎬 ویدیو جدید ذخیره شد!\n\n"
                     f"🔑 کد: {unique_key}\n"
-                    f"📁 حجم: {message.video.file_size // (1024*1024)} مگابایت\n"
+                    f"📁 حجم: {size_text}\n"
                     f"🔗 لینک مستقیم:\n{video_link}",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=video_link)]
                     ])
                 )
-                logging.info(f"ویدیو جدید با کد {unique_key} ذخیره شد")
+                logging.info(f"✅ ویدیو جدید با کد {unique_key} ذخیره شد")
             except Exception as e:
-                logging.error(f"خطا در ارسال پیام به ادمین: {e}")
+                logging.error(f"❌ خطا در ارسال پیام به ادمین: {e}")
         else:
-            logging.error("خطا در ذخیره ویدیو در دیتابیس")
+            logging.error("❌ خطا در ذخیره ویدیو در دیتابیس")
             
     except Exception as e:
-        logging.error(f"خطا در پردازش پست کانال: {e}")
+        logging.error(f"❌ خطا در پردازش پست کانال: {e}")
 
 # ==================== ارسال ویدیو به کاربر ====================
 async def send_video_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, video_key: str, user_id: int):
@@ -242,17 +269,17 @@ async def send_video_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if hasattr(update, 'callback_query') and update.callback_query:
             await update.callback_query.edit_message_text(success_text)
         
-        logging.info(f"کاربر {user_id} ویدیو {video_key} را دریافت کرد")
+        logging.info(f"✅ کاربر {user_id} ویدیو {video_key} را دریافت کرد")
 
     except Exception as e:
-        logging.error(f"خطا در ارسال ویدیو: {e}")
+        logging.error(f"❌ خطا در ارسال ویدیو: {e}")
         error_text = "❌ خطا در ارسال ویدیو. لطفاً بعداً تلاش کنید."
         if hasattr(update, 'callback_query') and update.callback_query:
             await update.callback_query.edit_message_text(error_text)
         else:
             await update.message.reply_text(error_text)
 
-# ==================== هندلر استارت ====================
+# ==================== هندلر استارت - نسخه اصلاح شده ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -296,18 +323,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # بررسی اینکه آیا کاربر قبلاً عضو شده است
             if db.has_user_joined(user_id):
                 # کاربر قبلاً عضو شده، مستقیماً ویدیو را ارسال کن
+                logging.info(f"✅ کاربر {user_id} قبلاً عضو شده، ارسال ویدیو")
                 await send_video_to_user(update, context, video_key, user_id)
                 return
             else:
                 # بررسی عضویت فعلی کاربر
+                logging.info(f"🔍 بررسی عضویت فعلی کاربر {user_id}")
                 is_member = await check_channel_membership(user_id, context)
                 if is_member:
                     # کاربر عضو است، وضعیت را ذخیره کن و ویدیو را ارسال کن
+                    logging.info(f"✅ کاربر {user_id} عضو است، ذخیره وضعیت و ارسال ویدیو")
                     db.set_user_joined(user_id)
                     await send_video_to_user(update, context, video_key, user_id)
                     return
                 else:
                     # کاربر عضو نیست، درخواست عضویت بده
+                    logging.info(f"❌ کاربر {user_id} عضو نیست، درخواست عضویت")
                     db.set_pending_video(user_id, video_key)
                     join_text = f"""
 ⚠️ برای دریافت ویدیو باید در کانال ما عضو شوید.
@@ -315,6 +346,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📢 کانال: {FORCE_CHANNEL}
 
 ✅ پس از عضویت، روی دکمه «بررسی عضویت» کلیک کنید.
+
+💡 نکته: اگر قبلاً عضو شده‌اید، ممکن است نیاز باشد دوباره بررسی کنید.
                     """
                     await update.message.reply_text(
                         join_text,
@@ -335,12 +368,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
 
-# ==================== هندلر دکمه‌ها ====================
+# ==================== هندلر دکمه‌ها - نسخه اصلاح شده ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     data = query.data
+
+    logging.info(f"🔘 دکمه فشرده شده: {data} توسط کاربر {user_id}")
 
     if data.startswith("check_join"):
         # استخراج video_key از callback_data
@@ -352,15 +387,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not video_key:
             video_key = db.get_pending_video(user_id)
 
+        logging.info(f"🔍 بررسی عضویت برای کاربر {user_id}، ویدیو: {video_key}")
+
         # بررسی عضویت کاربر
         is_member = await check_channel_membership(user_id, context)
         
         if is_member:
             # کاربر عضو شده است
+            logging.info(f"✅ کاربر {user_id} عضو است، ذخیره وضعیت")
             db.set_user_joined(user_id)
             
             if video_key:
                 # ویدیو را ارسال کن
+                logging.info(f"🎬 ارسال ویدیو {video_key} به کاربر {user_id}")
                 await send_video_to_user(update, context, video_key, user_id)
             else:
                 await query.edit_message_text(
@@ -369,12 +408,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             # کاربر هنوز عضو نشده
+            logging.warning(f"❌ کاربر {user_id} هنوز عضو نیست")
             await query.edit_message_text(
                 "❌ هنوز در کانال عضو نشده‌اید!\n\n"
                 "لطفاً:\n"
                 "1. روی دکمه «عضویت در کانال» کلیک کنید\n"
                 "2. در کانال عضو شوید\n"
-                "3. سپس روی «بررسی عضویت» کلیک کنید",
+                "3. سپس روی «بررسی عضویت» کلیک کنید\n\n"
+                "💡 نکته: اگر عضو شده‌اید، ممکن است نیاز باشد چند ثانیه صبر کنید سپس دوباره بررسی کنید.",
                 reply_markup=get_join_keyboard(video_key)
             )
 
@@ -470,13 +511,11 @@ https://t.me/{BOT_USERNAME}?start=video_ABC123XYZ
 
 # ==================== هندلر خطا ====================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.error(f"خطا در پردازش بروزرسانی: {context.error}")
+    logging.error(f"❌ خطا در پردازش بروزرسانی: {context.error}")
     
     if isinstance(context.error, Conflict):
-        logging.warning("درگیری تشخیص داده شد - احتمالاً نمونه‌های متعدد ربات در حال اجرا هستند")
-        # صبر کردن و سپس خاتمه دادن
+        logging.warning("⚠️ درگیری تشخیص داده شد - احتمالاً نمونه‌های متعدد ربات در حال اجرا هستند")
         await asyncio.sleep(5)
-        raise SystemExit("ربات متوقف شد به دلیل درگیری")
 
 # ==================== تنظیمات لاگ و اجرا ====================
 def main():
