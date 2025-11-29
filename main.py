@@ -3,641 +3,368 @@ import logging
 import sqlite3
 import secrets
 import string
-import asyncio
 from datetime import datetime
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.error import BadRequest, Conflict
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from telegram.error import BadRequest
 
 # ==================== تنظیمات ====================
-TOKEN = os.getenv("BOT_TOKEN", "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Senderpfilesbot").lstrip("@")
-FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "@betdesignernet")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7321524568"))
-PORT = int(os.getenv("PORT", 8080))
-RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
+TOKEN = "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0"
+BOT_USERNAME = "Senderpfilesbot"
+
+# 🔥 مهم: از ID عددی کانال استفاده کنید
+# برای پیدا کردن ID: پیامی از کانال را فوروارد کنید به @userinfobot
+FORCE_CHANNEL = "-1002920455639"  # جایگزین کنید با ID واقعی کانال شما
+
+ADMIN_ID = 7321524568
 
 # ==================== دیتابیس ====================
 class Database:
-    def __init__(self, db_path="/data/database.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_path = db_path
+    def __init__(self):
+        self.conn = sqlite3.connect('bot.db', check_same_thread=False)
         self.init_db()
-
-    def get_connection(self):
-        return sqlite3.connect(self.db_path, check_same_thread=False)
-
+    
     def init_db(self):
-        with self.get_connection() as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS videos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    unique_key TEXT UNIQUE NOT NULL,
-                    file_id TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    joined INTEGER DEFAULT 0,
-                    first_name TEXT,
-                    username TEXT,
-                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS user_sessions (
-                    user_id INTEGER PRIMARY KEY,
-                    pending_video_key TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-        logging.info("دیتابیس آماده است")
-
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS videos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                unique_key TEXT UNIQUE,
+                file_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                joined BOOLEAN DEFAULT FALSE,
+                username TEXT,
+                first_name TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.commit()
+        logging.info("✅ دیتابیس آماده است")
+    
     def add_video(self, unique_key, file_id):
-        with self.get_connection() as conn:
-            try:
-                conn.execute('''
-                    INSERT INTO videos (unique_key, file_id)
-                    VALUES (?, ?)
-                ''', (unique_key, file_id))
-                return True
-            except sqlite3.IntegrityError:
-                logging.warning(f"کلید تکراری: {unique_key}")
-                return False
-            except Exception as e:
-                logging.error(f"خطا در ذخیره ویدیو: {e}")
-                return False
-
+        try:
+            self.conn.execute('INSERT INTO videos (unique_key, file_id) VALUES (?, ?)', (unique_key, file_id))
+            self.conn.commit()
+            logging.info(f"✅ ویدیو با کد {unique_key} ذخیره شد")
+            return True
+        except Exception as e:
+            logging.error(f"❌ خطا در ذخیره ویدیو: {e}")
+            return False
+    
     def get_video(self, unique_key):
-        with self.get_connection() as conn:
-            cur = conn.execute('SELECT unique_key, file_id FROM videos WHERE unique_key = ?', (unique_key,))
-            row = cur.fetchone()
-            if row:
-                return {'unique_key': row[0], 'file_id': row[1]}
-            return None
-
-    def get_all_videos(self):
-        with self.get_connection() as conn:
-            cur = conn.execute('SELECT unique_key, file_id, created_at FROM videos ORDER BY created_at DESC')
-            return [{'unique_key': r[0], 'file_id': r[1], 'created_at': r[2]} for r in cur.fetchall()]
-
-    def add_user(self, user_id, first_name, username):
-        with self.get_connection() as conn:
-            conn.execute('''
-                INSERT OR IGNORE INTO users (user_id, first_name, username)
-                VALUES (?, ?, ?)
-            ''', (user_id, first_name, username))
-
-    def set_user_joined(self, user_id):
-        with self.get_connection() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO users (user_id, joined, joined_at)
-                VALUES (?, 1, CURRENT_TIMESTAMP)
-            ''', (user_id,))
-
+        cursor = self.conn.execute('SELECT file_id FROM videos WHERE unique_key = ?', (unique_key,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    
+    def set_user_joined(self, user_id, username="", first_name=""):
+        self.conn.execute(
+            'INSERT OR REPLACE INTO users (user_id, joined, username, first_name) VALUES (?, ?, ?, ?)', 
+            (user_id, True, username, first_name)
+        )
+        self.conn.commit()
+        logging.info(f"✅ کاربر {user_id} به عنوان عضو ثبت شد")
+    
     def has_user_joined(self, user_id):
-        with self.get_connection() as conn:
-            cur = conn.execute('SELECT joined FROM users WHERE user_id = ?', (user_id,))
-            row = cur.fetchone()
-            return row and row[0] == 1
-
-    def set_pending_video(self, user_id, video_key):
-        with self.get_connection() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO user_sessions (user_id, pending_video_key)
-                VALUES (?, ?)
-            ''', (user_id, video_key))
-
-    def get_pending_video(self, user_id):
-        with self.get_connection() as conn:
-            cur = conn.execute('SELECT pending_video_key FROM user_sessions WHERE user_id = ?', (user_id,))
-            row = cur.fetchone()
-            return row[0] if row else None
-
-    def clear_pending_video(self, user_id):
-        with self.get_connection() as conn:
-            conn.execute('DELETE FROM user_sessions WHERE user_id = ?', (user_id,))
-
-    def get_stats(self):
-        with self.get_connection() as conn:
-            videos_count = conn.execute('SELECT COUNT(*) FROM videos').fetchone()[0]
-            users_count = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-            joined_users = conn.execute('SELECT COUNT(*) FROM users WHERE joined = 1').fetchone()[0]
-            return videos_count, users_count, joined_users
+        cursor = self.conn.execute('SELECT joined FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        return result[0] if result else False
 
 db = Database()
 
 # ==================== ابزارهای کمکی ====================
-def generate_unique_key(length=10):
-    alphabet = string.ascii_letters + string.digits
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
+def generate_key():
+    return 'vid_' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
 
-def create_video_link(unique_key):
-    return f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
-
-def get_join_keyboard(video_key=None):
-    channel_username = FORCE_CHANNEL.lstrip('@')
-    keyboard = [
-        [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{channel_username}")],
-        [InlineKeyboardButton("✅ بررسی عضویت", callback_data=f"check_join_{video_key}" if video_key else "check_join")]
+def create_keyboard(video_key=None):
+    buttons = [
+        [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/betdesignernet")],
+        [InlineKeyboardButton("✅ بررسی عضویت", callback_data=f"check_{video_key}" if video_key else "check")]
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(buttons)
 
 def get_main_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📊 آمار ربات", callback_data="stats")],
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 آمار", callback_data="stats")],
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
-# ==================== بررسی عضویت - نسخه کاملاً اصلاح شده ====================
-async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+# ==================== بررسی عضویت - نسخه بهبود یافته ====================
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    تابع کاملاً اصلاح شده برای بررسی عضویت کاربر در کانال
+    تابع پیشرفته برای بررسی عضویت کاربر
     """
     try:
-        logging.info(f"🔍 شروع بررسی عضویت برای کاربر {user_id} در کانال {FORCE_CHANNEL}")
+        logging.info(f"🔍 بررسی عضویت کاربر {user_id} در کانال {FORCE_CHANNEL}")
         
-        # بررسی اینکه آیا کانال با @ شروع می‌شود یا عددی است (ID)
-        if FORCE_CHANNEL.startswith('@'):
-            chat_id = FORCE_CHANNEL
-        else:
-            # اگر عددی است، به int تبدیل کن
-            try:
-                chat_id = int(FORCE_CHANNEL)
-            except ValueError:
-                chat_id = FORCE_CHANNEL
+        # بررسی با ID عددی کانال
+        member = await context.bot.get_chat_member(chat_id=FORCE_CHANNEL, user_id=user_id)
+        status = member.status
         
-        logging.info(f"📋 چت ID برای بررسی: {chat_id}")
-        
-        # دریافت اطلاعات عضویت
-        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        
-        # لاگ وضعیت دقیق کاربر
-        logging.info(f"👤 وضعیت دقیق کاربر {user_id}: {member.status}")
+        logging.info(f"👤 وضعیت کاربر {user_id}: {status}")
         
         # وضعیت‌های مجاز
-        allowed_statuses = ["member", "administrator", "creator"]
-        is_member = member.status in allowed_statuses
-        
-        logging.info(f"🎯 نتیجه نهایی بررسی عضویت کاربر {user_id}: {is_member} (وضعیت: {member.status})")
-        
-        return is_member
-        
+        if status in ['member', 'administrator', 'creator']:
+            logging.info(f"✅ کاربر {user_id} عضو کانال است")
+            return True
+        else:
+            logging.warning(f"❌ کاربر {user_id} عضو نیست. وضعیت: {status}")
+            return False
+            
     except BadRequest as e:
         error_msg = str(e)
-        logging.error(f"❌ خطای BadRequest در بررسی عضویت کاربر {user_id}: {error_msg}")
+        logging.error(f"❌ خطا در بررسی عضویت: {error_msg}")
         
-        # تشخیص نوع خطا
         if "Chat not found" in error_msg:
             logging.error("❌ کانال پیدا نشد! مطمئن شوید:")
-            logging.error("   - ربات در کانال ادمین است")
-            logging.error("   - آدرس کانال صحیح است")
-            logging.error("   - اگر کانال خصوصی است از ID عددی استفاده کنید")
+            logging.error("   1. از ID عددی کانال استفاده کنید")
+            logging.error("   2. ربات در کانال ادمین است")
+            logging.error("   3. ID کانال صحیح است")
         elif "bot is not a member" in error_msg:
             logging.error("❌ ربات عضو کانال نیست! ربات را به کانال اضافه کنید")
         elif "user not found" in error_msg:
             logging.error("❌ کاربر پیدا نشد")
-        elif "Not enough rights" in error_msg:
-            logging.error("❌ ربات دسترسی کافی ندارد! ربات باید ادمین کانال باشد")
-        else:
-            logging.error(f"❌ خطای BadRequest ناشناخته: {error_msg}")
-            
+        
         return False
         
     except Exception as e:
-        logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت کاربر {user_id}: {e}")
+        logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت: {e}")
         return False
 
-# ==================== هندلر پست کانال ====================
-async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==================== ارسال ویدیو ====================
+async def send_video(context, user_id, video_key, message_to_edit=None):
     try:
-        message = update.channel_post
-        
-        # فقط ویدیوها را پردازش کن
-        if not message.video:
-            return
-
-        # تولید کلید منحصر به فرد
-        unique_key = generate_unique_key()
-        
-        # ذخیره در دیتابیس
-        if db.add_video(unique_key, message.video.file_id):
-            # ایجاد لینک
-            video_link = create_video_link(unique_key)
-            
-            # ارسال لینک به ادمین
-            try:
-                file_size = message.video.file_size
-                size_text = f"{file_size // (1024*1024)} مگابایت" if file_size else "نامشخص"
-                
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"🎬 ویدیو جدید ذخیره شد!\n\n"
-                    f"🔑 کد: {unique_key}\n"
-                    f"📁 حجم: {size_text}\n"
-                    f"🔗 لینک مستقیم:\n{video_link}",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=video_link)]
-                    ])
-                )
-                logging.info(f"✅ ویدیو جدید با کد {unique_key} ذخیره شد")
-            except Exception as e:
-                logging.error(f"❌ خطا در ارسال پیام به ادمین: {e}")
-        else:
-            logging.error("❌ خطا در ذخیره ویدیو در دیتابیس")
-            
-    except Exception as e:
-        logging.error(f"❌ خطا در پردازش پست کانال: {e}")
-
-# ==================== ارسال ویدیو به کاربر ====================
-async def send_video_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, video_key: str, user_id: int):
-    try:
-        # پیدا کردن ویدیو در دیتابیس
-        video = db.get_video(video_key)
-        if not video:
-            error_text = "❌ ویدیو مورد نظر یافت نشد."
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(error_text)
+        file_id = db.get_video(video_key)
+        if not file_id:
+            error_text = "❌ ویدیو پیدا نشد. لینک ممکن است منقضی شده باشد."
+            if message_to_edit:
+                await message_to_edit.edit_text(error_text)
             else:
-                await update.message.reply_text(error_text)
+                await context.bot.send_message(user_id, error_text)
             return
-
+        
         # ارسال ویدیو
         await context.bot.send_video(
-            chat_id=user_id,
-            video=video['file_id'],
-            caption=f"🎬 ویدیو اختصاصی\n🔑 کد: {video_key}",
+            user_id, 
+            file_id, 
+            caption=f"🎬 ویدیو شما\n🔑 کد: {video_key}",
             reply_markup=get_main_keyboard()
         )
-
-        # پاک کردن session در انتظار
-        db.clear_pending_video(user_id)
-
-        success_text = f"✅ ویدیو با موفقیت ارسال شد!\nکد: {video_key}"
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.edit_message_text(success_text)
         
-        logging.info(f"✅ کاربر {user_id} ویدیو {video_key} را دریافت کرد")
-
+        if message_to_edit:
+            await message_to_edit.edit_text("✅ ویدیو با موفقیت ارسال شد!")
+        
+        # ثبت کاربر به عنوان عضو
+        db.set_user_joined(user_id)
+        logging.info(f"✅ ویدیو {video_key} برای کاربر {user_id} ارسال شد")
+        
     except Exception as e:
         logging.error(f"❌ خطا در ارسال ویدیو: {e}")
         error_text = "❌ خطا در ارسال ویدیو. لطفاً بعداً تلاش کنید."
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.edit_message_text(error_text)
+        if message_to_edit:
+            await message_to_edit.edit_text(error_text)
         else:
-            await update.message.reply_text(error_text)
+            await context.bot.send_message(user_id, error_text)
 
 # ==================== هندلر استارت ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     
-    # ذخیره اطلاعات کاربر
-    db.add_user(user_id, user.first_name, user.username)
-
-    # اگر کاربر ادمین است
-    if user_id == ADMIN_ID:
-        admin_text = f"""
-👑 سلام ادمین عزیز!
-
-🤖 به پنل مدیریت ربات خوش آمدید.
-
-📊 دستورات مدیریتی:
-/stats - نمایش آمار ربات
-/videos - لیست ویدیوها
-/help - راهنمای کاربران
-/test - تست عضویت
-
-🎬 برای آپلود ویدیو، آن را در کانال خصوصی آپلود کنید.
-        """
-        await update.message.reply_text(admin_text, reply_markup=get_main_keyboard())
-        return
-
-    # بررسی آرگومان استارت
+    logging.info(f"🚀 کاربر {user_id} دستور /start را اجرا کرد")
+    
+    # اگر آرگومان دارد (یعنی از لینک آمده)
     if context.args:
         start_arg = context.args[0]
         
         if start_arg.startswith("video_"):
             video_key = start_arg.replace("video_", "")
+            logging.info(f"🎬 درخواست ویدیو {video_key} توسط کاربر {user_id}")
             
             # بررسی وجود ویدیو
-            video = db.get_video(video_key)
-            if not video:
+            if not db.get_video(video_key):
                 await update.message.reply_text(
-                    "❌ ویدیو مورد نظر یافت نشد.",
+                    "❌ لینک معتبر نیست یا ویدیو حذف شده است.",
                     reply_markup=get_main_keyboard()
                 )
                 return
-
-            # بررسی اینکه آیا کاربر قبلاً عضو شده است
+            
+            # اگر کاربر قبلاً عضو شده
             if db.has_user_joined(user_id):
-                # کاربر قبلاً عضو شده، مستقیماً ویدیو را ارسال کن
                 logging.info(f"✅ کاربر {user_id} قبلاً عضو شده، ارسال ویدیو")
-                await send_video_to_user(update, context, video_key, user_id)
+                await send_video(context, user_id, video_key)
                 return
+            
+            # بررسی عضویت فعلی
+            logging.info(f"🔍 بررسی عضویت کاربر {user_id}")
+            is_member = await check_membership(user_id, context)
+            
+            if is_member:
+                logging.info(f"✅ کاربر {user_id} عضو است، ارسال ویدیو")
+                db.set_user_joined(user_id, user.username, user.first_name)
+                await send_video(context, user_id, video_key)
             else:
-                # بررسی عضویت فعلی کاربر
-                logging.info(f"🔍 بررسی عضویت فعلی کاربر {user_id}")
-                is_member = await check_channel_membership(user_id, context)
-                if is_member:
-                    # کاربر عضو است، وضعیت را ذخیره کن و ویدیو را ارسال کن
-                    logging.info(f"✅ کاربر {user_id} عضو است، ذخیره وضعیت و ارسال ویدیو")
-                    db.set_user_joined(user_id)
-                    await send_video_to_user(update, context, video_key, user_id)
-                    return
-                else:
-                    # کاربر عضو نیست، درخواست عضویت بده
-                    logging.info(f"⚠️ کاربر {user_id} عضو نیست، درخواست عضویت")
-                    db.set_pending_video(user_id, video_key)
-                    join_text = f"""
-⚠️ برای دریافت ویدیو باید در کانال ما عضو شوید.
+                logging.info(f"⚠️ کاربر {user_id} عضو نیست، نمایش پیام عضویت")
+                await update.message.reply_text(
+                    "⚠️ برای دریافت ویدیو باید در کانال ما عضو شوید.\n\n"
+                    "📢 @betdesignernet\n\n"
+                    "✅ پس از عضویت روی دکمه زیر کلیک کنید:",
+                    reply_markup=create_keyboard(video_key)
+                )
+    else:
+        # پیام خوشامدگویی معمولی
+        await update.message.reply_text(
+            f"سلام {user.first_name}! 🤖\n\n"
+            f"به ربات دریافت ویدیو خوش آمدید.\n\n"
+            f"🎬 برای دریافت ویدیو روی لینک مخصوص کلیک کنید.\n"
+            f"📢 کانال: @betdesignernet\n\n"
+            f"🔍 برای اطلاعات بیشتر از منو استفاده کنید.",
+            reply_markup=get_main_keyboard()
+        )
 
-📢 کانال: {FORCE_CHANNEL}
-
-✅ پس از عضویت، روی دکمه «بررسی عضویت» کلیک کنید.
-
-🔍 اگر قبلاً عضو شده‌اید اما این پیام را می‌بینید:
-• مطمئن شوید ربات در کانال ادمین است
-• چند ثانیه صبر کنید سپس دوباره بررسی کنید
-• با ادمین تماس بگیرید
-                    """
-                    await update.message.reply_text(
-                        join_text,
-                        reply_markup=get_join_keyboard(video_key)
-                    )
-                    return
-
-    # پیام خوشامدگویی معمولی
-    welcome_text = f"""
-🤖 به ربات دریافت ویدیو خوش آمدید {user.first_name}!
-
-🎬 برای دریافت ویدیو، روی لینک مخصوص آن کلیک کنید.
-
-📢 برای دسترسی به تمام ویدیوها، در کانال ما عضو شوید:
-{FORCE_CHANNEL}
-
-🔍 برای اطلاعات بیشتر روی «راهنما» کلیک کنید.
-    """
-    await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
-
-# ==================== هندلر دکمه‌ها ====================
+# ==================== هندلر دکمه ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
     user_id = query.from_user.id
     data = query.data
-
-    logging.info(f"🔘 دکمه فشرده شده: {data} توسط کاربر {user_id}")
-
-    if data.startswith("check_join"):
-        # استخراج video_key از callback_data
-        video_key = None
-        if data.startswith("check_join_"):
-            video_key = data.replace("check_join_", "")
+    
+    logging.info(f"🔘 دکمه {data} توسط کاربر {user_id} فشرده شد")
+    
+    if data.startswith("check_"):
+        video_key = data.replace("check_", "")
         
-        # اگر video_key در callback_data نبود، از session بگیر
-        if not video_key:
-            video_key = db.get_pending_video(user_id)
-
-        logging.info(f"🔍 بررسی عضویت برای کاربر {user_id}، ویدیو: {video_key}")
-
-        # بررسی عضویت کاربر
-        is_member = await check_channel_membership(user_id, context)
+        logging.info(f"🔍 بررسی عضویت برای کاربر {user_id} (از طریق دکمه)")
+        is_member = await check_membership(user_id, context)
         
         if is_member:
-            # کاربر عضو شده است
-            logging.info(f"✅ کاربر {user_id} عضو است، ذخیره وضعیت")
             db.set_user_joined(user_id)
-            
-            if video_key:
-                # ویدیو را ارسال کن
-                logging.info(f"🎬 ارسال ویدیو {video_key} به کاربر {user_id}")
-                await send_video_to_user(update, context, video_key, user_id)
-            else:
-                await query.edit_message_text(
-                    "✅ عالی! شما عضو کانال هستید. حالا می‌توانید از لینک‌های ویدیو استفاده کنید.",
-                    reply_markup=get_main_keyboard()
-                )
+            await send_video(context, user_id, video_key, query.message)
         else:
-            # کاربر هنوز عضو نشده
-            logging.warning(f"❌ کاربر {user_id} هنوز عضو نیست")
             await query.edit_message_text(
                 "❌ هنوز در کانال عضو نشده‌اید!\n\n"
                 "لطفاً:\n"
-                "1. روی دکمه «عضویت در کانال» کلیک کنید\n"
-                "2. در کانال عضو شوید\n"
-                "3. سپس روی «بررسی عضویت» کلیک کنید\n\n"
-                "🔍 اگر قبلاً عضو شده‌اید:\n"
-                "• مطمئن شوید ربات در کانال ادمین است\n"
-                "• چند ثانیه صبر کنید سپس دوباره بررسی کنید\n"
-                "• از ادمین بخواهید وضعیت را بررسی کند",
-                reply_markup=get_join_keyboard(video_key)
+                "1. روی 'عضویت در کانال' کلیک کنید\n"
+                "2. در کانال @betdesignernet عضو شوید\n" 
+                "3. سپس دوباره روی 'بررسی عضویت' کلیک کنید\n\n"
+                "🔍 اگر عضو شده‌اید اما این پیام را می‌بینید:\n"
+                "• چند ثانیه صبر کنید\n"
+                "• از کانال خارج و دوباره عضو شوید\n"
+                "• با ادمین تماس بگیرید",
+                reply_markup=create_keyboard(video_key)
             )
-
+    
     elif data == "stats":
-        videos_count, users_count, joined_users = db.get_stats()
-        stats_text = f"""
-📊 آمار ربات:
-
-🎬 تعداد ویدیوها: {videos_count}
-👥 کاربران کل: {users_count}
-✅ کاربران عضو: {joined_users}
-📅 آخرین بروزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-        """
-        await query.edit_message_text(stats_text, reply_markup=get_main_keyboard())
-
+        # نمایش آمار ساده
+        await query.edit_message_text(
+            "📊 آمار ربات:\n\n"
+            "🤖 وضعیت: فعال\n"
+            "🔗 کانال: @betdesignernet\n"
+            "👤 برای دریافت ویدیو از لینک استفاده کنید",
+            reply_markup=get_main_keyboard()
+        )
+    
     elif data == "help":
-        help_text = f"""
-📖 راهنمای ربات:
+        await query.edit_message_text(
+            "📖 راهنمای ربات:\n\n"
+            "🎬 روش دریافت ویدیو:\n"
+            "1. روی لینک مخصوص ویدیو کلیک کنید\n"
+            "2. در کانال عضو شوید\n"
+            "3. روی 'بررسی عضویت' کلیک کنید\n"
+            "4. ویدیو دریافت می‌شود\n\n"
+            "✅ پس از اولین عضویت:\n"
+            "• دیگر نیازی به بررسی نیست\n"
+            "• تمام ویدیوها مستقیم ارسال می‌شوند\n\n"
+            "📢 کانال: @betdesignernet",
+            reply_markup=get_main_keyboard()
+        )
 
-🎬 روش دریافت ویدیو:
-1. روی لینک مخصوص ویدیو کلیک کنید
-2. اگر عضو کانال نیستید، ابتدا عضو شوید
-3. روی «بررسی عضویت» کلیک کنید
-4. ویدیو برای شما ارسال می‌شود
+# ==================== هندلر آپلود ویدیو ====================
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.channel_post or not update.channel_post.video:
+        return
+    
+    video = update.channel_post.video
+    unique_key = generate_key()
+    
+    if db.add_video(unique_key, video.file_id):
+        link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
+        
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"🎬 ویدیو جدید ذخیره شد!\n\n"
+                f"🔑 کد: {unique_key}\n"
+                f"📊 حجم: {video.file_size // (1024*1024)} MB\n"
+                f"🔗 لینک:\n{link}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=link)
+                ]])
+            )
+        except Exception as e:
+            logging.error(f"❌ خطا در ارسال به ادمین: {e}")
 
-✅ پس از اولین عضویت:
-• برای همیشه به تمام ویدیوها دسترسی دارید
-• نیازی به بررسی مجدد عضویت نیست
-
-📢 کانال اجباری: {FORCE_CHANNEL}
-
-⚡ در صورت مشکل با ادمین تماس بگیرید.
-        """
-        await query.edit_message_text(help_text, reply_markup=get_main_keyboard())
-
-# ==================== دستور تست عضویت ====================
-async def test_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور برای تست عضویت کاربر"""
-    user = update.effective_user
-    user_id = user.id
+# ==================== دستور تست ====================
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
-    # تست عضویت ادمین
-    is_member = await check_channel_membership(user_id, context)
+    is_member = await check_membership(user_id, context)
     
-    test_result = f"""
-🔍 نتیجه تست عضویت:
+    await update.message.reply_text(
+        f"🔍 تست عضویت:\n\n"
+        f"👤 کاربر: {user_id}\n"
+        f"📢 کانال: {FORCE_CHANNEL}\n"
+        f"✅ عضو است: {is_member}\n\n"
+        f"💡 اگر 'عضو است: False' ولی شما عضو هستید:\n"
+        f"• مطمئن شوید از ID عددی کانال استفاده می‌کنید\n"
+        f"• ربات باید ادمین کانال باشد\n"
+        f"• ID کانال باید صحیح باشد"
+    )
 
-👤 کاربر: {user.first_name} (ID: {user_id})
-📢 کانال: {FORCE_CHANNEL}
-✅ عضو است: {is_member}
-
-💡 اگر عضو نیستید اما باید باشید:
-1. مطمئن شوید ربات در کانال ادمین است
-2. اگر کانال خصوصی است از ID عددی استفاده کنید
-3. دسترسی ربات را چک کنید
-    """
-    
-    await update.message.reply_text(test_result)
-
-# ==================== دستورات ادمین ====================
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==================== دستور تنظیم مجدد ====================
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ دسترسی denied.")
-        return
-
-    videos_count, users_count, joined_users = db.get_stats()
-    stats_text = f"""
-📊 آمار کامل ربات:
-
-🎬 تعداد ویدیوها: {videos_count}
-👥 کل کاربران: {users_count}
-✅ کاربران عضو: {joined_users}
-🔗 کانال اجباری: {FORCE_CHANNEL}
-🤖 وضعیت: فعال ✅
-    """
-    await update.message.reply_text(stats_text)
-
-async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ دسترسی denied.")
-        return
-
-    videos = db.get_all_videos()
-    if not videos:
-        await update.message.reply_text("📭 هیچ ویدیویی در دیتابیس وجود ندارد.")
-        return
-
-    videos_text = "🎬 لیست ویدیوها:\n\n"
-    for i, video in enumerate(videos[:10], 1):
-        videos_text += f"{i}. کد: {video['unique_key']}\n   تاریخ: {video['created_at'][:16]}\n\n"
-
-    if len(videos) > 10:
-        videos_text += f"📁 و {len(videos) - 10} ویدیو دیگر..."
-
-    await update.message.reply_text(videos_text)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = f"""
-🤖 راهنمای ربات دریافت ویدیو
-
-🎬 روش کار:
-1. ویدیو را در کانال خصوصی آپلود کنید
-2. ربات自动 یک لینک خصوصی تولید می‌کند
-3. لینک را برای کاربران ارسال کنید
-4. کاربران پس از عضویت در کانال، ویدیو را دریافت می‌کنند
-
-📊 دستورات ادمین:
-/stats - نمایش آمار
-/videos - لیست ویدیوها
-/test - تست عضویت
-
-🔗 نمونه لینک:
-https://t.me/{BOT_USERNAME}?start=video_ABC123XYZ
-    """
-    await update.message.reply_text(help_text)
-
-# ==================== هندلر خطا ====================
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.error(f"❌ خطا در پردازش بروزرسانی: {context.error}")
     
-    if isinstance(context.error, Conflict):
-        logging.warning("⚠️ درگیری تشخیص داده شد - احتمالاً نمونه‌های متعدد ربات در حال اجرا هستند")
-        await asyncio.sleep(5)
+    if user_id != ADMIN_ID:
+        return
+    
+    # حذف وضعیت عضویت کاربر
+    db.conn.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+    db.conn.commit()
+    
+    await update.message.reply_text("✅ وضعیت عضویت شما بازنشانی شد. حالا دوباره تست کنید.")
 
-# ==================== تنظیمات لاگ و اجرا ====================
+# ==================== اجرای ربات ====================
 def main():
-    # تنظیمات لاگ
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO,
-        handlers=[
-            logging.StreamHandler()
-        ]
+        level=logging.INFO
     )
-    logger = logging.getLogger(__name__)
-
-    logger.info("🚀 در حال راه‌اندازی ربات...")
-    logger.info(f"🆔 ادمین: {ADMIN_ID}")
-    logger.info(f"📢 کانال اجباری: {FORCE_CHANNEL}")
-    logger.info(f"🤖 نام ربات: {BOT_USERNAME}")
-    logger.info(f"🌐 پورت: {PORT}")
-
-    try:
-        # ایجاد اپلیکیشن
-        app = Application.builder().token(TOKEN).build()
-
-        # اضافه کردن هندلرها
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("stats", stats_command))
-        app.add_handler(CommandHandler("videos", videos_command))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("test", test_membership))
-        app.add_handler(CallbackQueryHandler(button_handler))
-
-        # هندلر پست‌های کانال (فقط ویدیو)
-        app.add_handler(MessageHandler(filters.VIDEO, channel_post_handler))
-
-        # هندلر خطا
-        app.add_error_handler(error_handler)
-
-        logger.info("✅ ربات شروع به کار کرد")
-
-        # استفاده از webhook اگر URL استاتیک موجود باشد
-        if RAILWAY_STATIC_URL:
-            logger.info(f"🌐 استفاده از webhook با آدرس: {RAILWAY_STATIC_URL}")
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=TOKEN,
-                webhook_url=f"{RAILWAY_STATIC_URL}/{TOKEN}"
-            )
-        else:
-            logger.info("🔄 استفاده از polling")
-            # استفاده از polling با drop_pending_updates برای جلوگیری از درگیری
-            app.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
-                close_loop=False
-            )
-
-    except Conflict as e:
-        logger.error(f"❌ خطای درگیری: {e}")
-        logger.info("ربات دیگری در حال اجرا است. این نمونه متوقف می‌شود.")
-    except Exception as e:
-        logger.error(f"❌ خطا در راه‌اندازی ربات: {e}")
-        raise
+    
+    logging.info("🚀 شروع ربات...")
+    logging.info(f"📢 کانال اجباری: {FORCE_CHANNEL}")
+    logging.info(f"👑 ادمین: {ADMIN_ID}")
+    
+    app = Application.builder().token(TOKEN).build()
+    
+    # هندلرها
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", test_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    
+    logging.info("✅ ربات آماده است")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
