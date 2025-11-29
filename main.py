@@ -164,38 +164,61 @@ def get_main_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ==================== بررسی عضویت - نسخه اصلاح شده ====================
+# ==================== بررسی عضویت - نسخه کاملاً اصلاح شده ====================
 async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    تابع بهبود یافته برای بررسی عضویت کاربر در کانال
+    تابع کاملاً اصلاح شده برای بررسی عضویت کاربر در کانال
     """
     try:
-        # لاگ برای دیباگ
-        logging.info(f"🔍 بررسی عضویت کاربر {user_id} در کانال {FORCE_CHANNEL}")
+        logging.info(f"🔍 شروع بررسی عضویت برای کاربر {user_id} در کانال {FORCE_CHANNEL}")
         
-        # بررسی با استفاده از get_chat_member
-        member = await context.bot.get_chat_member(FORCE_CHANNEL, user_id)
+        # بررسی اینکه آیا کانال با @ شروع می‌شود یا عددی است (ID)
+        if FORCE_CHANNEL.startswith('@'):
+            chat_id = FORCE_CHANNEL
+        else:
+            # اگر عددی است، به int تبدیل کن
+            try:
+                chat_id = int(FORCE_CHANNEL)
+            except ValueError:
+                chat_id = FORCE_CHANNEL
         
-        # لاگ وضعیت کاربر
-        logging.info(f"👤 وضعیت کاربر {user_id} در کانال: {member.status}")
+        logging.info(f"📋 چت ID برای بررسی: {chat_id}")
         
-        # بررسی وضعیت‌های مجاز
+        # دریافت اطلاعات عضویت
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        
+        # لاگ وضعیت دقیق کاربر
+        logging.info(f"👤 وضعیت دقیق کاربر {user_id}: {member.status}")
+        
+        # وضعیت‌های مجاز
         allowed_statuses = ["member", "administrator", "creator"]
         is_member = member.status in allowed_statuses
         
-        logging.info(f"✅ نتیجه بررسی عضویت کاربر {user_id}: {is_member}")
+        logging.info(f"🎯 نتیجه نهایی بررسی عضویت کاربر {user_id}: {is_member} (وضعیت: {member.status})")
+        
         return is_member
         
     except BadRequest as e:
-        logging.error(f"❌ خطا در بررسی عضویت کاربر {user_id}: {e}")
-        # اگر کانال پیدا نشد یا ربات دسترسی ندارد
-        if "Chat not found" in str(e):
-            logging.error("❌ کانال پیدا نشد. مطمئن شوید ربات در کانال ادمین است")
-        elif "bot is not a member" in str(e):
-            logging.error("❌ ربات عضو کانال نیست")
-        elif "user not found" in str(e):
+        error_msg = str(e)
+        logging.error(f"❌ خطای BadRequest در بررسی عضویت کاربر {user_id}: {error_msg}")
+        
+        # تشخیص نوع خطا
+        if "Chat not found" in error_msg:
+            logging.error("❌ کانال پیدا نشد! مطمئن شوید:")
+            logging.error("   - ربات در کانال ادمین است")
+            logging.error("   - آدرس کانال صحیح است")
+            logging.error("   - اگر کانال خصوصی است از ID عددی استفاده کنید")
+        elif "bot is not a member" in error_msg:
+            logging.error("❌ ربات عضو کانال نیست! ربات را به کانال اضافه کنید")
+        elif "user not found" in error_msg:
             logging.error("❌ کاربر پیدا نشد")
+        elif "Not enough rights" in error_msg:
+            logging.error("❌ ربات دسترسی کافی ندارد! ربات باید ادمین کانال باشد")
+        else:
+            logging.error(f"❌ خطای BadRequest ناشناخته: {error_msg}")
+            
         return False
+        
     except Exception as e:
         logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت کاربر {user_id}: {e}")
         return False
@@ -279,7 +302,7 @@ async def send_video_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             await update.message.reply_text(error_text)
 
-# ==================== هندلر استارت - نسخه اصلاح شده ====================
+# ==================== هندلر استارت ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -298,6 +321,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - نمایش آمار ربات
 /videos - لیست ویدیوها
 /help - راهنمای کاربران
+/test - تست عضویت
 
 🎬 برای آپلود ویدیو، آن را در کانال خصوصی آپلود کنید.
         """
@@ -338,7 +362,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 else:
                     # کاربر عضو نیست، درخواست عضویت بده
-                    logging.info(f"❌ کاربر {user_id} عضو نیست، درخواست عضویت")
+                    logging.info(f"⚠️ کاربر {user_id} عضو نیست، درخواست عضویت")
                     db.set_pending_video(user_id, video_key)
                     join_text = f"""
 ⚠️ برای دریافت ویدیو باید در کانال ما عضو شوید.
@@ -347,7 +371,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ✅ پس از عضویت، روی دکمه «بررسی عضویت» کلیک کنید.
 
-💡 نکته: اگر قبلاً عضو شده‌اید، ممکن است نیاز باشد دوباره بررسی کنید.
+🔍 اگر قبلاً عضو شده‌اید اما این پیام را می‌بینید:
+• مطمئن شوید ربات در کانال ادمین است
+• چند ثانیه صبر کنید سپس دوباره بررسی کنید
+• با ادمین تماس بگیرید
                     """
                     await update.message.reply_text(
                         join_text,
@@ -368,7 +395,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
 
-# ==================== هندلر دکمه‌ها - نسخه اصلاح شده ====================
+# ==================== هندلر دکمه‌ها ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -415,7 +442,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "1. روی دکمه «عضویت در کانال» کلیک کنید\n"
                 "2. در کانال عضو شوید\n"
                 "3. سپس روی «بررسی عضویت» کلیک کنید\n\n"
-                "💡 نکته: اگر عضو شده‌اید، ممکن است نیاز باشد چند ثانیه صبر کنید سپس دوباره بررسی کنید.",
+                "🔍 اگر قبلاً عضو شده‌اید:\n"
+                "• مطمئن شوید ربات در کانال ادمین است\n"
+                "• چند ثانیه صبر کنید سپس دوباره بررسی کنید\n"
+                "• از ادمین بخواهید وضعیت را بررسی کند",
                 reply_markup=get_join_keyboard(video_key)
             )
 
@@ -450,6 +480,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⚡ در صورت مشکل با ادمین تماس بگیرید.
         """
         await query.edit_message_text(help_text, reply_markup=get_main_keyboard())
+
+# ==================== دستور تست عضویت ====================
+async def test_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور برای تست عضویت کاربر"""
+    user = update.effective_user
+    user_id = user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
+        return
+    
+    # تست عضویت ادمین
+    is_member = await check_channel_membership(user_id, context)
+    
+    test_result = f"""
+🔍 نتیجه تست عضویت:
+
+👤 کاربر: {user.first_name} (ID: {user_id})
+📢 کانال: {FORCE_CHANNEL}
+✅ عضو است: {is_member}
+
+💡 اگر عضو نیستید اما باید باشید:
+1. مطمئن شوید ربات در کانال ادمین است
+2. اگر کانال خصوصی است از ID عددی استفاده کنید
+3. دسترسی ربات را چک کنید
+    """
+    
+    await update.message.reply_text(test_result)
 
 # ==================== دستورات ادمین ====================
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,6 +561,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📊 دستورات ادمین:
 /stats - نمایش آمار
 /videos - لیست ویدیوها
+/test - تست عضویت
 
 🔗 نمونه لینک:
 https://t.me/{BOT_USERNAME}?start=video_ABC123XYZ
@@ -544,6 +603,7 @@ def main():
         app.add_handler(CommandHandler("stats", stats_command))
         app.add_handler(CommandHandler("videos", videos_command))
         app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("test", test_membership))
         app.add_handler(CallbackQueryHandler(button_handler))
 
         # هندلر پست‌های کانال (فقط ویدیو)
