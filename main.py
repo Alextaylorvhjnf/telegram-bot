@@ -47,6 +47,14 @@ class Database:
             )
         ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id INTEGER PRIMARY KEY,
+                pending_film_code TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         logging.info("✅ دیتابیس آماده است")
@@ -129,16 +137,53 @@ class Database:
         count = cursor.fetchone()[0]
         conn.close()
         return count
+    
+    def set_pending_film(self, user_id, film_code):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO user_sessions (user_id, pending_film_code)
+                VALUES (?, ?)
+            ''', (user_id, film_code))
+            conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"خطا در ذخیره session: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_pending_film(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT pending_film_code FROM user_sessions WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    
+    def clear_pending_film(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ?', (user_id,))
+            conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"خطا در پاک کردن session: {e}")
+            return False
+        finally:
+            conn.close()
 
 # ==================== Utilities ====================
 def create_start_link(film_code):
     return f"https://t.me/{BOT_USERNAME}?start={film_code}"
 
-def get_join_channel_keyboard():
+def get_join_channel_keyboard(film_code=None):
     channel_username = FORCE_SUB_CHANNEL.replace('@', '')
     keyboard = [
         [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{channel_username}")],
-        [InlineKeyboardButton("✅ عضو شدم", callback_data="check_join")]
+        [InlineKeyboardButton("✅ عضو شدم", callback_data=f"check_join_{film_code}" if film_code else "check_join")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -209,6 +254,9 @@ async def send_film_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     is_member = await check_user_membership(user_id, context)
     
     if not is_member:
+        # ذخیره فیلم در حال انتظار برای کاربر
+        db.set_pending_film(user_id, film_code)
+        
         join_text = f"""
 ⚠️ برای دریافت فیلم باید در کانال ما عضو شوید.
 
@@ -217,9 +265,9 @@ async def send_film_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 ✅ پس از عضویت روی «عضو شدم» کلیک کنید.
         """
         if update.message:
-            await update.message.reply_text(join_text, reply_markup=get_join_channel_keyboard())
+            await update.message.reply_text(join_text, reply_markup=get_join_channel_keyboard(film_code))
         else:
-            await update.callback_query.edit_message_text(join_text, reply_markup=get_join_channel_keyboard())
+            await update.callback_query.edit_message_text(join_text, reply_markup=get_join_channel_keyboard(film_code))
         return
     
     film = db.get_film(film_code)
@@ -242,6 +290,9 @@ async def send_film_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if update.callback_query:
             await update.callback_query.edit_message_text(success_text)
             
+        # پاک کردن فیلم در حال انتظار
+        db.clear_pending_film(user_id)
+        
         # لاگ دانلود
         user = update.effective_user
         logging.info(f"کاربر {user.id} ({user.first_name}) فیلم {film_code} را دانلود کرد")
@@ -328,12 +379,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     
-    if query.data == "check_join":
+    if query.data.startswith("check_join"):
+        # استخراج film_code از callback_data اگر موجود باشد
+        film_code = None
+        if query.data.startswith("check_join_"):
+            film_code = query.data.replace("check_join_", "")
+        
         is_member = await check_user_membership(user_id, context)
         if is_member:
-            await query.edit_message_text("✅ عالی! حالا می‌توانید از لینک فیلم استفاده کنید.", reply_markup=get_main_keyboard())
+            # اگر کاربر عضو شد، فیلم را ارسال کن
+            if film_code:
+                await send_film_to_user(update, context, film_code, user_id)
+            else:
+                # اگر film_code مشخص نبود، از session بگیر
+                pending_film = db.get_pending_film(user_id)
+                if pending_film:
+                    await send_film_to_user(update, context, pending_film, user_id)
+                else:
+                    await query.edit_message_text("✅ عالی! حالا می‌توانید از لینک فیلم استفاده کنید.", reply_markup=get_main_keyboard())
         else:
-            await query.edit_message_text("❌ هنوز در کانال عضو نشده‌اید. لطفاً ابتدا عضو شوید.", reply_markup=get_join_channel_keyboard())
+            await query.edit_message_text("❌ هنوز در کانال عضو نشده‌اید. لطفاً ابتدا عضو شوید و سپس روی «عضو شدم» کلیک کنید.", reply_markup=get_join_channel_keyboard(film_code))
     
     elif query.data == "list_films":
         films = db.get_all_films()
