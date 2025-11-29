@@ -182,14 +182,6 @@ def get_main_keyboard():
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
     ])
 
-def get_video_keyboard(video_key):
-    """کیبورد مخصوص ویدیو با آمار و راهنما"""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار این ویدیو", callback_data=f"videostats_{video_key}")],
-        [InlineKeyboardButton("💾 من ذخیره کردم", callback_data=f"save_{video_key}")],
-        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
-    ])
-
 # ==================== بررسی عضویت ====================
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """بررسی عضویت کاربر در کانال"""
@@ -269,7 +261,7 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
             parse_mode='Markdown'
         )
         
-        # ارسال فایل با کپشن
+        # ارسال فایل با کپشن (بدون دکمه‌های اضافی)
         caption = (
             f"🎬 **{title}**\n"
             f"🔑 کد: `{video_key}`\n\n"
@@ -283,16 +275,16 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
                 user_id, 
                 file_id, 
                 caption=caption,
-                parse_mode='Markdown',
-                reply_markup=get_video_keyboard(video_key)
+                parse_mode='Markdown'
+                # بدون reply_markup - هیچ دکمه‌ای نمایش داده نمی‌شود
             )
         except BadRequest:
             sent_message = await context.bot.send_document(
                 user_id,
                 file_id,
                 caption=caption,
-                parse_mode='Markdown',
-                reply_markup=get_video_keyboard(video_key)
+                parse_mode='Markdown'
+                # بدون reply_markup - هیچ دکمه‌ای نمایش داده نمی‌شود
             )
         
         # ذخیره اطلاعات پیام برای حذف خودکار
@@ -420,58 +412,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=create_join_keyboard(video_key)
             )
     
-    elif data.startswith("save_"):
-        video_key = data.split("_", 1)[1]
-        
-        # ثبت ذخیره کاربر
-        db.increment_save_count(video_key)
-        db.record_user_save(user_id, video_key)
-        
-        await query.answer("✅ با تشکر! ذخیره شما ثبت شد.", show_alert=True)
-        
-        # به‌روزرسانی آمار در پیام
-        video_data = db.get_video(video_key)
-        if video_data:
-            new_caption = (
-                f"🎬 **{video_data['title']}**\n"
-                f"🔑 کد: `{video_key}`\n\n"
-                f"📊 **آمار:** 👁️ {video_data['view_count']} بازدید | 💾 {video_data['save_count']} ذخیره\n\n"
-                f"⏰ این فایل 30 ثانیه دیگر حذف می‌شود!\n"
-                f"💾 برای استفاده بعدی، حتماً ذخیره کنید."
-            )
-            
-            try:
-                await query.message.edit_caption(
-                    caption=new_caption,
-                    reply_markup=get_video_keyboard(video_key),
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logging.error(f"خطا در به‌روزرسانی کپشن: {e}")
-    
-    elif data.startswith("videostats_"):
-        video_key = data.split("_", 1)[1]
-        video_data = db.get_video(video_key)
-        
-        if video_data:
-            stats_text = (
-                f"📊 **آمار دقیق این فایل**\n\n"
-                f"🎬 **عنوان:** {video_data['title']}\n"
-                f"🔑 **کد:** `{video_key}`\n\n"
-                f"👁️ **تعداد بازدید:** {video_data['view_count']}\n"
-                f"💾 **تعداد ذخیره‌سازی:** {video_data['save_count']}\n\n"
-                f"📈 **نرخ ذخیره‌سازی:** {round((video_data['save_count'] / video_data['view_count']) * 100, 1) if video_data['view_count'] > 0 else 0}%"
-            )
-            
-            await query.answer()
-            await query.message.reply_text(
-                stats_text,
-                parse_mode='Markdown',
-                reply_to_message_id=query.message.message_id
-            )
-        else:
-            await query.answer("❌ اطلاعات فایل یافت نشد.", show_alert=True)
-    
     elif data == "stats":
         # جمع‌آوری آمار
         video_stats = db.get_video_stats()
@@ -502,10 +442,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. در کانال عضو شوید\n"
             "3. روی دکمه تأیید عضویت کلیک کنید\n"
             "4. فایل دریافت می‌شود\n\n"
-            "📊 **دکمه‌های زیر فایل:**\n"
-            "• **آمار این ویدیو**: نمایش آمار دقیق این فایل\n"
-            "• **من ذخیره کردم**: ثبت ذخیره‌سازی شما\n"
-            "• **راهنما**: نمایش این راهنما\n\n"
             "⚠️ **توجه مهم:**\n"
             "• فایل‌ها 30 ثانیه پس از ارسال حذف می‌شوند\n"
             "• حتماً فایل را ذخیره کنید\n"
