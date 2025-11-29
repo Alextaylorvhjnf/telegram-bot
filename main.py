@@ -116,8 +116,7 @@ def generate_key():
 def create_join_keyboard(video_key=None):
     buttons = [
         [InlineKeyboardButton("📢 عضویت در کانال", url=FORCE_CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ تأیید عضویت (روش 1)", callback_data=f"method1_{video_key}" if video_key else "method1")],
-        [InlineKeyboardButton("🔍 تأیید عضویت (روش 2)", callback_data=f"method2_{video_key}" if video_key else "method2")]
+        [InlineKeyboardButton("✅ تأیید عضویت", callback_data=f"check_{video_key}" if video_key else "check")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -127,11 +126,11 @@ def get_main_keyboard():
         [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
     ])
 
-# ==================== روش‌های مختلف بررسی عضویت ====================
-async def check_membership_method1(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """روش 1: استفاده مستقیم از get_chat_member"""
+# ==================== بررسی عضویت ====================
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """بررسی عضویت کاربر در کانال"""
     try:
-        logging.info(f"🔍 روش 1: بررسی عضویت کاربر {user_id}")
+        logging.info(f"🔍 بررسی عضویت کاربر {user_id}")
         
         member = await context.bot.get_chat_member(chat_id=FORCE_CHANNEL_ID, user_id=user_id)
         status = member.status
@@ -139,65 +138,19 @@ async def check_membership_method1(user_id: int, context: ContextTypes.DEFAULT_T
         logging.info(f"👤 وضعیت کاربر {user_id}: {status}")
         
         if status in ['member', 'administrator', 'creator']:
-            logging.info(f"✅ کاربر {user_id} عضو است (روش 1)")
+            logging.info(f"✅ کاربر {user_id} عضو است")
             return True
         
         logging.warning(f"❌ کاربر {user_id} عضو نیست. وضعیت: {status}")
         return False
             
     except BadRequest as e:
-        logging.error(f"❌ خطا در روش 1: {e}")
+        logging.error(f"❌ خطا در بررسی عضویت: {e}")
         return False
         
     except Exception as e:
-        logging.error(f"❌ خطای غیرمنتظره در روش 1: {e}")
+        logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت: {e}")
         return False
-
-async def check_membership_method2(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """روش 2: ارسال پیام مخفی و بررسی خطا"""
-    try:
-        logging.info(f"🔍 روش 2: بررسی عضویت کاربر {user_id}")
-        
-        # سعی می‌کنیم پیامی در کانال ارسال کنیم (که فقط برای ادمین‌ها ممکن است)
-        # اگر کاربر عضو نباشد، خطای "user not participant" می‌گیریم
-        test_message = await context.bot.send_message(
-            chat_id=FORCE_CHANNEL_ID,
-            text=".",  # پیام مخفی
-            disable_notification=True
-        )
-        
-        # اگر موفق شد پیام بفرستد، کاربر عضو است
-        await context.bot.delete_message(chat_id=FORCE_CHANNEL_ID, message_id=test_message.message_id)
-        logging.info(f"✅ کاربر {user_id} عضو است (روش 2)")
-        return True
-        
-    except BadRequest as e:
-        error_msg = str(e)
-        if "USER_NOT_PARTICIPANT" in error_msg or "user not participant" in error_msg:
-            logging.info(f"❌ کاربر {user_id} عضو نیست (روش 2)")
-            return False
-        else:
-            logging.error(f"❌ خطای دیگر در روش 2: {error_msg}")
-            return False
-            
-    except Exception as e:
-        logging.error(f"❌ خطای غیرمنتظره در روش 2: {e}")
-        return False
-
-async def check_membership_all_methods(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """استفاده از تمام روش‌ها"""
-    # روش 1
-    result1 = await check_membership_method1(user_id, context)
-    if result1:
-        return True
-    
-    # صبر کردن و امتحان روش 2
-    await asyncio.sleep(2)
-    result2 = await check_membership_method2(user_id, context)
-    if result2:
-        return True
-    
-    return False
 
 # ==================== ارسال فایل به کاربر ====================
 async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
@@ -285,7 +238,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"🔒 برای دریافت فایل، لطفاً در کانال ما عضو شوید:\n\n"
                 f"📢 {CHANNEL_USERNAME}\n\n"
-                f"✅ پس از عضویت، یکی از روش‌های زیر را برای تأیید انتخاب کنید:",
+                f"✅ پس از عضویت، روی دکمه زیر کلیک کنید:",
                 reply_markup=create_join_keyboard(video_key)
             )
     else:
@@ -308,7 +261,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"🔘 دکمه {data} توسط کاربر {user_id} فشرده شد")
     
-    if data.startswith("method1_") or data.startswith("method2_"):
+    if data.startswith("check_"):
         video_key = data.split("_", 1)[1] if "_" in data else None
         
         if not video_key:
@@ -324,25 +277,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # نمایش پیام در حال بررسی
         await query.edit_message_text("🔍 در حال بررسی عضویت... لطفاً صبر کنید.")
         
-        # انتخاب روش بررسی
-        if data.startswith("method1_"):
-            is_member = await check_membership_method1(user_id, context)
-            method_name = "روش 1"
-        else:
-            is_member = await check_membership_method2(user_id, context)
-            method_name = "روش 2"
+        # بررسی عضویت
+        is_member = await check_membership(user_id, context)
         
         if is_member:
-            await query.edit_message_text(f"✅ عضویت شما تأیید شد! ({method_name})\n\nدر حال ارسال فایل...")
+            await query.edit_message_text("✅ عضویت شما تأیید شد!\n\nدر حال ارسال فایل...")
             db.set_user_joined(user_id)
             await send_video_to_user(context, user_id, video_key, query.message)
         else:
             await query.edit_message_text(
-                f"❌ عضویت شما تأیید نشد. ({method_name})\n\n"
+                f"❌ عضویت شما تأیید نشد.\n\n"
                 f"لطفاً مطمئن شوید:\n"
                 f"• در کانال {CHANNEL_USERNAME} عضو شده‌اید\n"
-                f"• از اکانت درست استفاده می‌کنید\n"
-                f"• روش دیگر را امتحان کنید\n\n"
+                f"• از اکانت درست استفاده می‌کنید\n\n"
                 f"اگر مشکل ادامه دارد، با ادمین تماس بگیرید.",
                 reply_markup=create_join_keyboard(video_key)
             )
@@ -362,7 +309,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎬 روش دریافت فایل:\n"
             "1. روی لینک مخصوص فایل کلیک کنید\n"
             "2. در کانال عضو شوید\n"
-            "3. روی یکی از دکمه‌های تأیید کلیک کنید\n"
+            "3. روی دکمه تأیید عضویت کلیک کنید\n"
             "4. فایل دریافت می‌شود\n\n"
             f"📢 کانال: {CHANNEL_USERNAME}",
             reply_markup=get_main_keyboard()
@@ -418,18 +365,16 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
-    # تست هر دو روش
-    result1 = await check_membership_method1(user_id, context)
-    result2 = await check_membership_method2(user_id, context)
+    # تست عضویت
+    result = await check_membership(user_id, context)
     
     await update.message.reply_text(
         f"🔍 تست عضویت:\n\n"
         f"👤 کاربر: {user_id}\n"
         f"📢 کانال ID: {FORCE_CHANNEL_ID}\n"
         f"🔗 لینک: {FORCE_CHANNEL_LINK}\n\n"
-        f"✅ روش 1 (get_chat_member): {result1}\n"
-        f"✅ روش 2 (send_message): {result2}\n\n"
-        f"💡 اگر هر دو False هستند:\n"
+        f"✅ وضعیت عضویت: {result}\n\n"
+        f"💡 اگر False است:\n"
         f"• مطمئن شوید ربات در کانال ادمین است\n"
         f"• مطمئن شوید شما در کانال عضو هستید"
     )
