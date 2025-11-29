@@ -569,8 +569,10 @@ def main():
     logger.info(f"📺 کانال خصوصی: {PRIVATE_CHANNEL_ID}")
     
     try:
+        # ایجاد application با استفاده از builder
         application = Application.builder().token(BOT_TOKEN).build()
         
+        # اضافه کردن هندلرها
         application.add_handler(CommandHandler("start", start_handler))
         application.add_handler(CommandHandler("help", help_handler))
         application.add_handler(CommandHandler("stats", stats_handler))
@@ -584,7 +586,12 @@ def main():
         ))
         
         logger.info("✅ ربات شروع به کار کرد")
-        application.run_polling()
+        
+        # اجرای ربات
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Exception as e:
         logger.error(f"❌ خطا در راه‌اندازی ربات: {e}")
