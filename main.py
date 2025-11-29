@@ -1,235 +1,161 @@
-import os
 import logging
 import sqlite3
 import secrets
 import string
-import asyncio
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import BadRequest, Forbidden
 
 # ==================== تنظیمات ====================
 TOKEN = "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0"
-BOT_USERNAME = "Senderpfilesbot"
-
+BOT_USERNAME = "Senderpfilesbot"          # بدون @
 FORCE_CHANNEL_ID = -1002034901903
-FORCE_CHANNEL_LINK = "https://t.me/betdesignernet/132"
-CHANNEL_USERNAME = "@betdesignernet"
+CHANNEL_LINK = "https://t.me/betdesignernet"
 ADMIN_ID = 7321524568
 
-# ==================== دیتابیس ====================
-class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect('bot.db', check_same_thread=False)
-        self.init_db()
+logging.basicConfig(level=logging.INFO)
 
-    def init_db(self):
-        self.conn.executescript('''
-            CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                unique_key TEXT UNIQUE,
-                file_id TEXT,
-                title TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                joined BOOLEAN DEFAULT 0,
-                username TEXT,
-                first_name TEXT,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS pending_requests (
-                user_id INTEGER,
-                video_key TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, video_key)
-            );
-        ''')
-        self.conn.commit()
-        logging.info("دیتابیس آماده است")
+# ==================== دیتابیس ساده ====================
+db = sqlite3.connect("bot.db", check_same_thread=False)
+db.execute("CREATE TABLE IF NOT EXISTS files (key TEXT PRIMARY KEY, file_id TEXT, title TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, joined INTEGER DEFAULT 0)")
+db.execute("CREATE TABLE IF NOT EXISTS pending (user_id INTEGER, key TEXT, PRIMARY KEY(user_id, key))")
+db.commit()
 
-    def add_video(self, unique_key, file_id, title=""):
-        try:
-            self.conn.execute('INSERT OR IGNORE INTO videos (unique_key, file_id, title) VALUES (?, ?, ?)',
-                            (unique_key, file_id, title))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logging.error(f"خطا در ذخیره ویدیو: {e}")
-            return False
+def add_file(key, file_id, title=""):
+    db.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?)", (key, file_id, title))
+    db.commit()
 
-    def get_video(self, unique_key):
-        cur = self.conn.execute('SELECT file_id, title FROM videos WHERE unique_key = ?', (unique_key,))
-        row = cur.fetchone()
-        return {'file_id': row[0], 'title': row[1]} if row else None
+def get_file(key):
+    cur = db.execute("SELECT file_id, title FROM files WHERE key=?", (key,))
+    row = cur.fetchone()
+    return {"file_id": row[0], "title": row[1]} if row else None
 
-    def set_user_joined(self, user_id, username="", first_name=""):
-        self.conn.execute('INSERT OR REPLACE INTO users (user_id, joined, username, first_name) VALUES (?, 1, ?, ?)',
-                         (user_id, username, first_name))
-        self.conn.commit()
+def user_joined(user_id):
+    db.execute("INSERT OR REPLACE INTO users VALUES (?, 1)", (user_id,))
+    db.commit()
 
-    def is_user_joined(self, user_id):
-        cur = self.conn.execute('SELECT joined FROM users WHERE user_id = ?', (user_id,))
-        row = cur.fetchone()
-        return bool(row[0]) if row else False
+def is_joined(user_id):
+    cur = db.execute("SELECT joined FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    return row and row[0] == 1
 
-    def add_pending(self, user_id, video_key):
-        self.conn.execute('INSERT OR IGNORE INTO pending_requests (user_id, video_key) VALUES (?, ?)',
-                         (user_id, video_key))
-        self.conn.commit()
+def add_pending(user_id, key):
+    db.execute("INSERT OR IGNORE INTO pending VALUES (?, ?)", (user_id, key))
+    db.commit()
 
-    def get_pending(self, user_id):
-        cur = self.conn.execute('SELECT video_key FROM pending_requests WHERE user_id = ?', (user_id,))
-        return [row[0] for row in cur.fetchall()]
+def remove_pending(user_id, key):
+    db.execute("DELETE FROM pending WHERE user_id=? AND key=?", (user_id, key))
+    db.commit()
 
-    def remove_pending(self, user_id, video_key):
-        self.conn.execute('DELETE FROM pending_requests WHERE user_id = ? AND video_key = ?', (user_id, video_key))
-        self.conn.commit()
+def get_pending(user_id):
+    cur = db.execute("SELECT key FROM pending WHERE user_id=?", (user_id,))
+    return [row[0] for row in cur.fetchall()]
 
-db = Database()
-
-# ==================== ابزارها ====================
-def generate_key():
-    return 'vid_' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10))
-
-def join_keyboard(video_key=None):
-    key = video_key or ""
+# ==================== کیبوردها ====================
+def join_kb(key=""):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("عضویت در کانال", url=FORCE_CHANNEL_LINK),
-    ], [
+        InlineKeyboardButton("عضویت در کانال", url=CHANNEL_LINK),
         InlineKeyboardButton("تأیید عضویت", callback_data=f"check_{key}")
     ]])
 
-def main_keyboard():
+def main_kb():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("آمار", callback_data="stats"),
         InlineKeyboardButton("راهنما", callback_data="help")
     ]])
 
-# ==================== بررسی عضویت (فقط روش درست) ====================
-async def is_member(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+# ==================== بررسی عضویت (درست و قطعی) ====================
+async def check_member(user_id):
     try:
-        member = await context.bot.get_chat_member(chat_id=FORCE_CHANNEL_ID, user_id=user_id)
+        member = await app.bot.get_chat_member(FORCE_CHANNEL_ID, user_id)
         return member.status in ("member", "administrator", "creator")
     except BadRequest as e:
-        if "user not found" in str(e).lower():
+        if "not found" in str(e):
             return False
-        logging.error(f"BadRequest چک عضویت: {e}")
-        return False
     except Forbidden:
-        logging.error("ربات از کانال بن شده یا دسترسی نداره")
+        logging.error("ربات از کانال بن شده یا دسترسی نداره!")
         return False
     except Exception as e:
         logging.error(f"خطا در چک عضویت: {e}")
-        return False
-
-# ==================== ارسال فایل ====================
-async def send_file(context: ContextTypes.DEFAULT_TYPE, user_id: int, video_key: str, msg_to_edit=None):
-    data = db.get_video(video_key)
-    if not data:
-        text = "فایل پیدا نشد یا حذف شده."
-        if msg_to_edit:
-            await msg_to_edit.edit_text(text)
-        else:
-            await context.bot.send_message(user_id, text)
-        return
-
-    caption = f"عنوان: {data['title'] or 'فایل'}\nکد: {video_key}\nکانال: {CHANNEL_USERNAME}"
-
-    try:
-        await context.bot.send_video(user_id, data['file_id'], caption=caption, reply_markup=main_keyboard())
-    except BadRequest:
-        try:
-            await context.bot.send_document(user_id, data['file_id'], caption=caption, reply_markup=main_keyboard())
-        except Exception as e2:
-            logging.error(f"ارسال ویدیو/داکیومنت ناموفق: {e2}")
-            await context.bot.send_message(user_id, "خطا در ارسال فایل.")
-
-    success = "فایل با موفقیت ارسال شد!"
-    if msg_to_edit:
-        await msg_to_edit.edit_text(success)
-    else:
-        await context.bot.send_message(user_id, success)
-
-    db.set_user_joined(user_id)
-    db.remove_pending(user_id, video_key)
+    return False
 
 # ==================== هندلرها ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
 
-    if args and args[0].startswith("video_"):
-        key = args[0].replace("video_", "", 1)
-        if not db.get_video(key):
-            await update.message.reply_text("لینک نامعتبر یا فایل حذف شده.", reply_markup=main_keyboard())
+    if args and args[0].startswith("vid_"):
+        key = args[0]
+
+        if not get_file(key):
+            await update.message.reply_text("فایل پیدا نشد یا حذف شده.", reply_markup=main_kb())
             return
 
-        if db.is_user_joined(user.id):
+        if is_joined(user.id):
             await send_file(context, user.id, key)
             return
 
-        db.add_pending(user.id, key)
+        add_pending(user.id, key)
         await update.message.reply_text(
-            f"برای دریافت فایل باید در کانال عضو شوید:\n\n"
-            f"کانال: {CHANNEL_USERNAME}\n\n"
-            f"بعد از عضویت روی دکمه زیر بزنید:",
-            reply_markup=join_keyboard(key)
+            "برای دریافت فایل باید عضو کانال بشید:\n\n"
+            f"کانال: {CHANNEL_LINK}\n\n"
+            "بعد از عضویت روی «تأیید عضویت» بزنید",
+            reply_markup=join_kb(key)
         )
     else:
         await update.message.reply_text(
             f"سلام {user.first_name}!\n\n"
-            f"به ربات دانلود فایل خوش آمدید\n"
-            f"لینک مخصوص فایل رو بزنید تا فایل رو دریافت کنید\n"
-            f"کانال: {CHANNEL_USERNAME}",
-            reply_markup=main_keyboard()
+            "لینک فایل رو برام بفرست تا فایل رو بگیری\n"
+            f"کانال: {CHANNEL_LINK}",
+            reply_markup=main_kb()
         )
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    data = q.data
 
     if data.startswith("check_"):
-        key = data[6:] if data[6:] else None
-        if not key:
-            pending = db.get_pending(user_id)
-            key = pending[0] if pending else None
-        if not key or not db.get_video(key):
-            await query.edit_message_text("لینک نامعتبر.")
+        key = data[6:] or get_pending(user_id)[0] if get_pending(user_id) else None
+        if not key or not get_file(key):
+            await q.edit_message_text("لینک اشتباهه")
             return
 
-        await query.edit_message_text("در حال بررسی عضویت...")
+        await q.edit_message_text("در حال چک کردن عضویت...")
 
-        if await is_member(user_id, context):
-            await query.edit_message_text("عضویت تأیید شد! در حال ارسال فایل...")
-            await send_file(context, user_id, key, query.message)
+        if await check_member(user_id):
+            await q.edit_message_text("عضویت تأیید شد! در حال ارسال فایل...")
+            user_joined(user_id)
+            remove_pending(user_id, key)
+            await send_file(context, user_id, key)
         else:
-            await query.edit_message_text(
-                "هنوز عضو کانال نیستید!\n\n"
-                f"لطفاً در {CHANNEL_USERNAME} عضو شوید و دوباره امتحان کنید.",
-                reply_markup=join_keyboard(key)
+            await q.edit_message_text(
+                "هنوز عضو کانال نیستی!\n\n"
+                "اول برو عضو کانال شو، بعد دوباره بزن «تأیید عضویت»",
+                reply_markup=join_kb(key)
             )
 
     elif data == "stats":
-        await query.edit_message_text("ربات فعاله\nبرای دریافت فایل از لینک استفاده کنید", reply_markup=main_keyboard())
+        await q.edit_message_text("ربات فعاله", reply_markup=main_kb())
     elif data == "help":
-        await query.edit_message_text(
-            "راهنما:\n"
-            "1. روی لینک فایل کلیک کنید\n"
-            "2. در کانال عضو شوید\n"
-            "3. روی «تأیید عضویت» بزنید\n"
-            "4. فایل دریافت میشه",
-            reply_markup=main_keyboard()
-        )
+        await q.edit_message_text("روی لینک فایل بزن → عضو کانال شو → تأیید عضویت → فایل میاد", reply_markup=main_kb())
 
-# ==================== دریافت فایل از کانال ====================
-async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_file(context, user_id, key):
+    data = get_file(key)
+    caption = f"{data['title']}\nکد: {key}\nکانال: {CHANNEL_LINK}"
+
+    try:
+        await context.bot.send_video(user_id, data["file_id"], caption=caption, reply_markup=main_kb())
+    except:
+        await context.bot.send_document(user_id, data["file_id"], caption=caption, reply_markup=main_kb())
+    await context.bot.send_message(user_id, "فایل ارسال شد!")
+
+# ==================== وقتی تو کانال فایل آپلود میشه ====================
+async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
-    if not msg or msg.chat.id != FORCE_CHANNEL_ID:
+    if msg.chat.id != FORCE_CHANNEL_ID:
         return
 
     file_id = None
@@ -242,55 +168,22 @@ async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = msg.document.file_id
         title = msg.caption or msg.document.file_name or "داکیومنت"
 
-    if not file_id:
-        return
-
-    key = generate_key()
-    if db.add_video(key, file_id, title):
-        link = f"https://t.me/{BOT_USERNAME}?start=video_{key}"
+    if file_id:
+        key = "vid_" + secrets.token_hex(5)
+        add_file(key, file_id, title)
+        link = f"https://t.me/{BOT_USERNAME}?start={key}"
         await context.bot.send_message(
             ADMIN_ID,
-            f"فایل جدید ذخیره شد!\n\n"
-            f"عنوان: {title}\n"
-            f"کد: {key}\n"
-            f"لینک: {link}",
+            f"فایل جدید!\n\nعنوان: {title}\nلینک:\n{link}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("اشتراک لینک", url=link)]])
         )
 
-# ==================== دستورات ادمین ====================
-async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    res = await is_member(update.effective_user.id, context)
-    await update.message.reply_text(f"نتیجه چک عضویت شما: {'عضو هستید' if res else 'عضو نیستید'}")
-
-async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or not context.args:
-        return
-    try:
-        uid = int(context.args[0])
-        db.set_user_joined(uid)
-        for key in db.get_pending(uid):
-            await send_file(context, uid, key)
-        await update.message.reply_text(f"کاربر {uid} دستی تأیید شد.")
-    except:
-        await update.message.reply_text("آیدی اشتباهه")
-
 # ==================== اجرا ====================
-def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    logging.info("ربات در حال شروع...")
+app = Application.builder().token(TOKEN).build()
 
-    app = Application.builder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button))
+app.add_handler(MessageHandler(filters.CHAT_TYPE_CHANNEL & (filters.VIDEO | filters.DOCUMENT), channel_handler))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("test", test))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & (filters.VIDEO | filters.Document.ALL), channel_post))
-
-    logging.info("ربات آماده و در حال اجراست!")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+print("ربات روشن شد...")
+app.run_polling(drop_pending_updates=True)
