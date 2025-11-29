@@ -3,6 +3,7 @@ import logging
 import sqlite3
 import secrets
 import string
+import asyncio
 from datetime import datetime
 
 from telegram import (
@@ -18,17 +19,20 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # ==================== تنظیمات ====================
 TOKEN = os.getenv("BOT_TOKEN", "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Senderpfilesbot").lstrip("@")
 FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "@betdesignernet")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7321524568"))
+PORT = int(os.getenv("PORT", 8080))
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
 
 # ==================== دیتابیس ====================
 class Database:
-    def __init__(self, db_path="database.db"):
+    def __init__(self, db_path="/data/database.db"):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
         self.init_db()
 
@@ -437,7 +441,7 @@ async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     videos_text = "🎬 لیست ویدیوها:\n\n"
-    for i, video in enumerate(videos[:10], 1):  # فقط 10 تا اول
+    for i, video in enumerate(videos[:10], 1):
         videos_text += f"{i}. کد: {video['unique_key']}\n   تاریخ: {video['created_at'][:16]}\n\n"
 
     if len(videos) > 10:
@@ -464,6 +468,16 @@ https://t.me/{BOT_USERNAME}?start=video_ABC123XYZ
     """
     await update.message.reply_text(help_text)
 
+# ==================== هندلر خطا ====================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.error(f"خطا در پردازش بروزرسانی: {context.error}")
+    
+    if isinstance(context.error, Conflict):
+        logging.warning("درگیری تشخیص داده شد - احتمالاً نمونه‌های متعدد ربات در حال اجرا هستند")
+        # صبر کردن و سپس خاتمه دادن
+        await asyncio.sleep(5)
+        raise SystemExit("ربات متوقف شد به دلیل درگیری")
+
 # ==================== تنظیمات لاگ و اجرا ====================
 def main():
     # تنظیمات لاگ
@@ -471,8 +485,7 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         level=logging.INFO,
         handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('bot.log', encoding='utf-8')
+            logging.StreamHandler()
         ]
     )
     logger = logging.getLogger(__name__)
@@ -481,6 +494,7 @@ def main():
     logger.info(f"🆔 ادمین: {ADMIN_ID}")
     logger.info(f"📢 کانال اجباری: {FORCE_CHANNEL}")
     logger.info(f"🤖 نام ربات: {BOT_USERNAME}")
+    logger.info(f"🌐 پورت: {PORT}")
 
     try:
         # ایجاد اپلیکیشن
@@ -496,14 +510,32 @@ def main():
         # هندلر پست‌های کانال (فقط ویدیو)
         app.add_handler(MessageHandler(filters.VIDEO, channel_post_handler))
 
+        # هندلر خطا
+        app.add_error_handler(error_handler)
+
         logger.info("✅ ربات شروع به کار کرد")
 
-        # شروع polling
-        app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
+        # استفاده از webhook اگر URL استاتیک موجود باشد
+        if RAILWAY_STATIC_URL:
+            logger.info(f"🌐 استفاده از webhook با آدرس: {RAILWAY_STATIC_URL}")
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=TOKEN,
+                webhook_url=f"{RAILWAY_STATIC_URL}/{TOKEN}"
+            )
+        else:
+            logger.info("🔄 استفاده از polling")
+            # استفاده از polling با drop_pending_updates برای جلوگیری از درگیری
+            app.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False
+            )
 
+    except Conflict as e:
+        logger.error(f"❌ خطای درگیری: {e}")
+        logger.info("ربات دیگری در حال اجرا است. این نمونه متوقف می‌شود.")
     except Exception as e:
         logger.error(f"❌ خطا در راه‌اندازی ربات: {e}")
         raise
