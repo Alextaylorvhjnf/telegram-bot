@@ -1,11 +1,23 @@
-# main.py - نسخه نهایی و کاملاً کارکردی (2025)
+# main.py - نسخه کامل و اصلاح شده
 import os
 import logging
 import sqlite3
 import re
+from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from telegram.error import BadRequest
 
 # ==================== تنظیمات ====================
@@ -16,209 +28,509 @@ PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "-1002920455639"))
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "7321524568").split(",") if x.strip()]
 
 # ==================== دیتابیس ====================
-class DB:
-    def __init__(self):
-        self.conn = sqlite3.connect("bot.db", check_same_thread=False)
-        self.create_tables()
+class Database:
+    def __init__(self, db_path="films_bot.db"):
+        self.db_path = db_path
+        self.init_db()
 
-    def create_tables(self):
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS films (
-                code TEXT PRIMARY KEY,
-                file_id TEXT,
-                title TEXT,
-                caption TEXT
-            )
-        ''')
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS pending (
-                user_id INTEGER PRIMARY KEY,
-                film_code TEXT
-            )
-        ''')
-        self.conn.commit()
+    def get_connection(self):
+        return sqlite3.connect(self.db_path, check_same_thread=False)
 
-    def add_film(self, code, file_id, title="", caption=""):
-        self.conn.execute("INSERT OR REPLACE INTO films VALUES (?, ?, ?, ?)", (code.lower(), file_id, title, caption))
-        self.conn.commit()
+    def init_db(self):
+        with self.get_connection() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS films (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    film_code TEXT UNIQUE NOT NULL,
+                    file_id TEXT NOT NULL,
+                    title TEXT,
+                    caption TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    user_id INTEGER PRIMARY KEY,
+                    pending_film_code TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+        logging.info("دیتابیس آماده است")
 
-    def get_film(self, code):
-        cur = self.conn.execute("SELECT file_id, title, caption FROM films WHERE code = ?", (code.lower(),))
-        row = cur.fetchone()
-        return {"file_id": row[0], "title": row[1], "caption": row[2]} if row else None
+    def add_film(self, film_code, file_id, title=None, caption=None):
+        with self.get_connection() as conn:
+            try:
+                conn.execute('''
+                    INSERT OR REPLACE INTO films (film_code, file_id, title, caption)
+                    VALUES (?, ?, ?, ?)
+                ''', (film_code, file_id, title, caption))
+                return True
+            except Exception as e:
+                logging.error(f"خطا در ذخیره فیلم: {e}")
+                return False
 
-    def set_pending(self, user_id, code):
-        self.conn.execute("INSERT OR REPLACE INTO pending VALUES (?, ?)", (user_id, code.lower()))
-        self.conn.commit()
+    def get_film(self, film_code):
+        with self.get_connection() as conn:
+            cur = conn.execute('SELECT film_code, file_id, title, caption FROM films WHERE film_code = ?', (film_code,))
+            row = cur.fetchone()
+            if row:
+                return {'film_code': row[0], 'file_id': row[1], 'title': row[2], 'caption': row[3]}
+            return None
 
-    def get_pending(self, user_id):
-        cur = self.conn.execute("SELECT film_code FROM pending WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        return row[0] if row else None
+    def get_all_films(self):
+        with self.get_connection() as conn:
+            cur = conn.execute('SELECT film_code, title FROM films ORDER BY added_at DESC')
+            return [{'film_code': r[0], 'title': r[1] or r[0]} for r in cur.fetchall()]
 
-    def clear_pending(self, user_id):
-        self.conn.execute("DELETE FROM pending WHERE user_id = ?", (user_id,))
-        self.conn.commit()
+    def get_all_films_detailed(self):
+        with self.get_connection() as conn:
+            cur = conn.execute('SELECT film_code, title, file_id, added_at FROM films ORDER BY added_at DESC')
+            return [{'film_code': r[0], 'title': r[1], 'file_id': r[2], 'added_at': r[3]} for r in cur.fetchall()]
 
-db = DB()
+    def add_user(self, user_id, username, first_name, last_name):
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO users (user_id, username, first_name, last_name)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, username, first_name, last_name))
+
+    def get_users_count(self):
+        with self.get_connection() as conn:
+            return conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+
+    def get_films_count(self):
+        with self.get_connection() as conn:
+            return conn.execute('SELECT COUNT(*) FROM films').fetchone()[0]
+
+    def set_pending_film(self, user_id, film_code):
+        with self.get_connection() as conn:
+            conn.execute('INSERT OR REPLACE INTO user_sessions (user_id, pending_film_code) VALUES (?, ?)',
+                         (user_id, film_code))
+
+    def get_pending_film(self, user_id):
+        with self.get_connection() as conn:
+            row = conn.execute('SELECT pending_film_code FROM user_sessions WHERE user_id = ?', (user_id,)).fetchone()
+            return row[0] if row else None
+
+    def clear_pending_film(self, user_id):
+        with self.get_connection() as conn:
+            conn.execute('DELETE FROM user_sessions WHERE user_id = ?', (user_id,))
+
+db = Database()
 
 # ==================== کیبوردها ====================
-def link(code): return f"https://t.me/{BOT_USERNAME}?start={code}"
+def create_start_link(code):
+    return f"https://t.me/{BOT_USERNAME}?start={code}"
 
-def join_kb(code=None):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("عضویت در کانال", url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}"),
-        InlineKeyboardButton("عضو شدم", callback_data=f"check_{code}" if code else "check")
-    ]])
+def get_join_keyboard(code=None):
+    url = f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("عضویت در کانال", url=url)],
+        [InlineKeyboardButton("عضو شدم", callback_data=f"check_join_{code}" if code else "check_join")]
+    ])
 
-def main_kb():
+def get_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("راهنما", callback_data="help")],
-        [InlineKeyboardButton("لیست فیلم‌ها", callback_data="list")]
+        [InlineKeyboardButton("لیست فیلم‌ها", callback_data="list_films")]
+    ])
+
+def get_admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("آمار ربات", callback_data="admin_stats")],
+        [InlineKeyboardButton("مدیریت فیلم‌ها", callback_data="admin_films")],
+        [InlineKeyboardButton("مدیریت کاربران", callback_data="admin_users")],
+        [InlineKeyboardButton("بازگشت", callback_data="back_to_main")]
     ])
 
 # ==================== چک عضویت ====================
-async def is_member(user_id, context):
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
-        chat_member = await context.bot.get_chat_member(FORCE_SUB_CHANNEL, user_id)
-        return chat_member.status in ["member", "administrator", "creator"]
-    except:
+        member = await context.bot.get_chat_member(FORCE_SUB_CHANNEL, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except BadRequest as e:
+        logging.error(f"خطا در چک عضویت: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"خطا در چک عضویت: {e}")
         return False
 
-# ==================== ارسال فیلم ====================
-async def send_film(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, user_id: int):
-    if not await is_member(user_id, context):
-        db.set_pending(user_id, code)
-        text = f"برای دریافت فیلم، اول باید در کانال عضو بشی:\n{FORCE_SUB_CHANNEL}"
-        kb = join_kb(code)
-        if update.message:
-            await update.message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
-        else:
-            await update.callback_query.edit_message_text(text, reply_markup=kb, disable_web_page_preview=True)
+# ==================== هندلر پست کانال خصوصی ====================
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.channel_post.chat_id != PRIVATE_CHANNEL_ID:
         return
-
-    film = db.get_film(code)
-    if not film:
-        await (update.message or update.callback_query.message).reply_text("فیلم پیدا نشد یا حذف شده.")
-        return
-
-    caption = film.get("caption") or film.get("title") or f"فیلم {code.upper()}"
-    try:
-        if film["file_id"].startswith(("BA", "Ag")):  # ویدیو
-            await context.bot.send_video(user_id, film["file_id"], caption=caption, reply_markup=main_kb())
-        else:
-            await context.bot.send_document(user_id, film["file_id"], caption=caption, reply_markup=main_kb())
-
-        success_text = f"فیلم {code.upper()} برات ارسال شد"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(success_text)
-        db.clear_pending(user_id)
-    except Exception as e:
-        logging.error(f"خطا ارسال: {e}")
-        await (update.message or update.callback_query.message).reply_text("خطا در ارسال. دوباره امتحان کن.")
-
-# ==================== هندلرهای اصلی ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args
-
-    if user_id in ADMIN_IDS and args:
-        return await send_film(update, context, args[0], user_id)
-
-    if args:
-        return await send_film(update, context, args[0], user_id)
-
-    await update.message.reply_text(
-        f"سلام {update.effective_user.first_name}!\nبه ربات دانلود فیلم خوش اومدی\n\n"
-        f"کانال ما: {FORCE_SUB_CHANNEL}\n"
-        "لینک فیلم رو برات بفرستم بفرست!",
-        reply_markup=main_kb()
-    )
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    user_id = q.from_user.id
-
-    # دکمه "عضو شدم"
-    if data.startswith("check"):
-        code = data[6:] if len(data) > 5 else db.get_pending(user_id)  # check_film123 → film123
-
-        if await is_member(user_id, context):
-            if code:
-                await send_film(update, context, code, user_id)
-            else:
-                await q.edit_message_text("عالی! حالا لینک فیلم رو بفرست", reply_markup=main_kb())
-        else:
-            await q.edit_message_text("هنوز عضو نشدی!\nاول عضو شو بعد دوباره بزن «عضو شدم»", reply_markup=join_kb(code or ""))
-
-    # لیست فیلم‌ها
-    elif data == "list":
-        cur = db.conn.execute("SELECT code, title FROM films ORDER BY rowid DESC LIMIT 20")
-        if not cur.fetchall():
-            await q.edit_message_text("هنوز فیلمی اضافه نشده.")
-            return
-        text = "لیست فیلم‌ها:\n\n"
-        kb = []
-        for code, title in cur:
-            title = title or code.upper()
-            text += f"• {title}\n"
-            kb.append([InlineKeyboardButton(title, url=link(code))])
-        kb.append([InlineKeyboardButton("بازگشت", callback_data="back")])
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
-
-    elif data == "help":
-        await q.edit_message_text(
-            "راهنما:\n\n"
-            "1. روی لینک فیلم کلیک کن\n"
-            "2. اگر گفت عضو شو → عضو کانال شو\n"
-            "3. روی «عضو شدم» بزن\n"
-            "4. فیلم برات میاد!\n\n"
-            f"کانال: {FORCE_SUB_CHANNEL}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="back")]])
-        )
-
-    elif data == "back":
-        await q.edit_message_text("به منوی اصلی برگشتی", reply_markup=main_kb())
-
-# ==================== دریافت فیلم از کانال خصوصی ====================
-async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
-    if msg.chat.id != PRIVATE_CHANNEL:
-        return
     if not (msg.video or msg.document):
         return
 
     file_id = msg.video.file_id if msg.video else msg.document.file_id
     caption = msg.caption or ""
 
-    match = re.search(r'film\d+', caption, re.I)
+    match = re.search(r'film\d+', caption, re.IGNORECASE)
     if not match:
+        logging.warning("کد فیلم در کپشن پیدا نشد")
         return
 
-    code = match.group().lower()
-    title = caption.split("\n")[0][:100] if caption else "فیلم"
+    film_code = match.group().lower()
+    title = caption.split("\n")[0] if "\n" in caption else caption[:100]
 
-    db.add_film(code, file_id, title, caption)
+    if db.add_film(film_code, file_id, title, caption):
+        logging.info(f"فیلم {film_code} ذخیره شد")
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"فیلم جدید ذخیره شد:\n\nکد: {film_code}\nعنوان: {title}"
+                )
+            except Exception as e:
+                logging.error(f"خطا در اطلاع‌رسانی به ادمین: {e}")
 
-    for admin in ADMIN_IDS:
-        try:
-            await context.bot.send_message(admin, f"فیلم جدید اضافه شد:\n{code.upper()}\n{title}")
-        except:
-            pass
+# ==================== ارسال فیلم به کاربر ====================
+async def send_film(update: Update, context: ContextTypes.DEFAULT_TYPE, film_code: str, user_id: int):
+    film = db.get_film(film_code)
+    if not film:
+        error_text = "❌ فیلم مورد نظر یافت نشد."
+        if update.message:
+            await update.message.reply_text(error_text)
+        else:
+            await update.callback_query.edit_message_text(error_text)
+        return
+
+    caption = film['caption'] or film['title'] or f"🎬 فیلم {film_code}"
+    try:
+        # تشخیص نوع فایل و ارسال مناسب
+        if film['file_id'].startswith(('BA', 'Ag')):
+            await context.bot.send_video(chat_id=user_id, video=film['file_id'], caption=caption)
+        else:
+            await context.bot.send_document(chat_id=user_id, document=film['file_id'], caption=caption)
+
+        success_text = f"✅ فیلم {film_code} با موفقیت ارسال شد"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(success_text, reply_markup=get_main_keyboard())
+        elif update.message:
+            await update.message.reply_text(success_text, reply_markup=get_main_keyboard())
+
+        # پاک کردن فیلم در حال انتظار
+        db.clear_pending_film(user_id)
+
+        # لاگ دانلود
+        user = update.effective_user
+        logging.info(f"کاربر {user.id} ({user.first_name}) فیلم {film_code} را دانلود کرد")
+
+    except Exception as e:
+        logging.error(f"خطا در ارسال فیلم: {e}")
+        error_text = "❌ خطا در ارسال فیلم. لطفاً بعداً تلاش کنید."
+        if update.message:
+            await update.message.reply_text(error_text)
+        else:
+            await update.callback_query.edit_message_text(error_text)
+
+# ==================== /start ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+
+    # ذخیره کاربر
+    db.add_user(user_id, user.username, user.first_name, user.last_name)
+
+    # اگر کاربر ادمین است
+    if user_id in ADMIN_IDS:
+        admin_text = f"""
+👑 سلام ادمین {user.first_name}!
+🤖 به پنل مدیریت ربات خوش آمدید.
+📊 می‌توانید از دستورات زیر استفاده کنید:
+/stats - نمایش آمار ربات
+/films - لیست کامل فیلم‌ها
+/users - تعداد کاربران
+/help - راهنمای کاربران
+        """
+
+        if context.args:
+            film_code = context.args[0]
+            return await send_film(update, context, film_code, user_id)
+        else:
+            await update.message.reply_text(admin_text, reply_markup=get_admin_keyboard())
+        return
+
+    # کاربر عادی
+    if context.args:
+        film_code = context.args[0]
+        is_member = await check_membership(user_id, context)
+        
+        if is_member:
+            # اگر کاربر عضو است، مستقیماً فیلم را ارسال کن
+            await send_film(update, context, film_code, user_id)
+        else:
+            # اگر عضو نیست، درخواست عضویت بده
+            db.set_pending_film(user_id, film_code)
+            text = f"""
+⚠️ برای دریافت فیلم باید در کانال ما عضو شوید.
+📢 {FORCE_SUB_CHANNEL}
+✅ پس از عضویت روی «عضو شدم» کلیک کنید.
+            """
+            await update.message.reply_text(text, reply_markup=get_join_keyboard(film_code))
+        return
+
+    welcome_text = f"""
+🤖 به ربات دریافت فیلم خوش آمدید {user.first_name}!
+🎬 برای دریافت فیلم روی لینک مخصوص آن کلیک کنید.
+📢 حتما در کانال ما عضو شوید:
+{FORCE_SUB_CHANNEL}
+🔍 برای راهنمایی بیشتر روی دکمه «راهنما» کلیک کنید.
+    """
+    await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
+
+# ==================== /help ====================
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = f"""
+📖 راهنمای ربات:
+🎬 روش دریافت فیلم:
+1. روی لینک مخصوص فیلم کلیک کنید
+2. اگر لینک کار نکرد، در کانال عضو شوید
+3. پس از عضویت دکمه «عضو شدم» را بزنید
+4. فیلم برای شما ارسال می‌شود
+📋 مشاهده فیلم‌ها:
+• روی دکمه «لیست فیلم‌ها» کلیک کنید
+• یا از لینک مستقیم استفاده کنید
+🔗 لینک نمونه:
+https://t.me/{BOT_USERNAME}?start=film001
+📢 کانال: {FORCE_SUB_CHANNEL}
+⚡ در صورت مشکل به ادمین پیام دهید.
+    """
+    await update.message.reply_text(help_text)
+
+# ==================== دکمه‌ها ====================
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data.startswith("check_join"):
+        # استخراج film_code از callback_data
+        film_code = None
+        if data.startswith("check_join_"):
+            film_code = data.replace("check_join_", "")
+        
+        # اگر film_code در callback_data نبود، از session بگیر
+        if not film_code:
+            film_code = db.get_pending_film(user_id)
+
+        # بررسی عضویت کاربر
+        is_member = await check_membership(user_id, context)
+        
+        if is_member:
+            if film_code:
+                # کاربر عضو شده و film_code موجود است - فیلم را ارسال کن
+                await send_film(update, context, film_code, user_id)
+            else:
+                # کاربر عضو شده اما film_code موجود نیست
+                await query.edit_message_text(
+                    "✅ عالی! شما عضو کانال هستید. حالا می‌توانید از لینک فیلم استفاده کنید.", 
+                    reply_markup=get_main_keyboard()
+                )
+        else:
+            # کاربر هنوز عضو نشده
+            await query.edit_message_text(
+                "❌ هنوز در کانال عضو نشده‌اید. لطفاً ابتدا عضو شوید و سپس روی «عضو شدم» کلیک کنید.", 
+                reply_markup=get_join_keyboard(film_code)
+            )
+
+    elif data == "list_films":
+        films = db.get_all_films()
+        if not films:
+            await query.edit_message_text("📭 در حال حاضر فیلمی موجود نیست.", reply_markup=get_main_keyboard())
+            return
+
+        films_text = "🎬 لیست فیلم‌های موجود:\n\n"
+        keyboard = []
+        for film in films[:15]:
+            film_title = film['title']
+            films_text += f"• {film_title}\n"
+            keyboard.append([InlineKeyboardButton(film_title, url=create_start_link(film['film_code']))])
+
+        keyboard.append([InlineKeyboardButton("بازگشت ◀️", callback_data="back_to_main")])
+        await query.edit_message_text(films_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "help":
+        help_text = f"""
+📖 راهنمای ربات:
+🎬 روش دریافت فیلم:
+1. روی لینک مخصوص فیلم کلیک کنید
+2. اگر لینک کار نکرد، در کانال عضو شوید
+3. پس از عضویت دکمه «عضو شدم» را بزنید
+🔗 لینک نمونه:
+https://t.me/{BOT_USERNAME}?start=film001
+📢 کانال: {FORCE_SUB_CHANNEL}
+        """
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت ◀️", callback_data="back_to_main")]]))
+
+    elif data == "back_to_main":
+        if user_id in ADMIN_IDS:
+            admin_text = "👑 به پنل مدیریت بازگشتید."
+            await query.edit_message_text(admin_text, reply_markup=get_admin_keyboard())
+        else:
+            welcome_text = "🤖 به ربات دریافت فیلم خوش آمدید!\n\n🎬 برای دریافت فیلم روی لینک مخصوص آن کلیک کنید."
+            await query.edit_message_text(welcome_text, reply_markup=get_main_keyboard())
+
+    elif data == "admin_stats":
+        if user_id not in ADMIN_IDS:
+            await query.edit_message_text("❌ دسترسی denied.")
+            return
+
+        films_count = db.get_films_count()
+        users_count = db.get_users_count()
+
+        stats_text = f"""
+📊 آمار ربات:
+🎬 تعداد فیلم‌ها: {films_count}
+👥 تعداد کاربران: {users_count}
+🆔 تعداد ادمین‌ها: {len(ADMIN_IDS)}
+🤖 وضعیت: فعال ✅
+        """
+        await query.edit_message_text(stats_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت ◀️", callback_data="back_to_main")]]))
+
+    elif data == "admin_films":
+        if user_id not in ADMIN_IDS:
+            await query.edit_message_text("❌ دسترسی denied.")
+            return
+
+        films = db.get_all_films_detailed()
+        if not films:
+            await query.edit_message_text("📭 هیچ فیلمی در دیتابیس وجود ندارد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت ◀️", callback_data="back_to_main")]]))
+            return
+
+        films_text = "🎬 لیست کامل فیلم‌ها:\n\n"
+        for i, film in enumerate(films[:10], 1):
+            films_text += f"{i}. {film['title']}\n کد: {film['film_code']}\n تاریخ: {film['added_at'][:16]}\n\n"
+
+        if len(films) > 10:
+            films_text += f"\n📁 و {len(films) - 10} فیلم دیگر..."
+
+        await query.edit_message_text(films_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت ◀️", callback_data="back_to_main")]]))
+
+    elif data == "admin_users":
+        if user_id not in ADMIN_IDS:
+            await query.edit_message_text("❌ دسترسی denied.")
+            return
+
+        users_count = db.get_users_count()
+        users_text = f"""
+👥 آمار کاربران:
+📊 تعداد کل کاربران: {users_count}
+🆔 ادمین فعلی: {user_id}
+        """
+        await query.edit_message_text(users_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت ◀️", callback_data="back_to_main")]]))
+
+# ==================== دستورات ادمین ====================
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ شما دسترسی به این دستور را ندارید.")
+        return
+
+    films_count = db.get_films_count()
+    users_count = db.get_users_count()
+
+    stats_text = f"""
+📊 آمار کامل ربات:
+🎬 تعداد فیلم‌ها: {films_count}
+👥 تعداد کاربران: {users_count}
+🆔 تعداد ادمین‌ها: {len(ADMIN_IDS)}
+🔗 کانال اجباری: {FORCE_SUB_CHANNEL}
+📺 کانال خصوصی: {PRIVATE_CHANNEL_ID}
+🤖 وضعیت: فعال ✅
+    """
+    await update.message.reply_text(stats_text)
+
+async def films_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ شما دسترسی به این دستور را ندارید.")
+        return
+
+    films = db.get_all_films_detailed()
+
+    if not films:
+        await update.message.reply_text("📭 هیچ فیلمی در دیتابیس وجود ندارد.")
+        return
+
+    films_text = "🎬 لیست کامل فیلم‌ها:\n\n"
+
+    for i, film in enumerate(films, 1):
+        films_text += f"{i}. {film['title']}\n کد: {film['film_code']}\n تاریخ: {film['added_at'][:16]}\n\n"
+
+    if len(films_text) > 4000:
+        films_text = films_text[:4000] + "\n\n... (لیست کامل در لاگ‌ها موجود است)"
+
+    await update.message.reply_text(films_text)
+
+async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ شما دسترسی به این دستور را ندارید.")
+        return
+
+    users_count = db.get_users_count()
+
+    users_text = f"""
+👥 آمار کاربران:
+📊 تعداد کل کاربران: {users_count}
+🆔 ادمین فعلی: {user_id}
+📅 کاربران در دیتابیس ذخیره شده‌اند.
+    """
+    await update.message.reply_text(users_text)
 
 # ==================== main ====================
 def main():
-    logging.basicConfig(level=logging.INFO)
-    app = Application.builder().token(BOT_TOKEN).build()
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
+    logger = logging.getLogger(__name__)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.Chat(PRIVATE_CHANNEL) & (filters.VIDEO | filters.DOCUMENT), channel_post))
+    logger.info("🚀 در حال راه‌اندازی ربات...")
+    logger.info(f"🆔 ادمین‌ها: {ADMIN_IDS}")
+    logger.info(f"📢 کانال اجباری: {FORCE_SUB_CHANNEL}")
+    logger.info(f"📺 کانال خصوصی: {PRIVATE_CHANNEL_ID}")
 
-    logging.info("ربات با موفقیت راه‌اندازی شد!")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        # ایجاد application
+        app = Application.builder().token(BOT_TOKEN).build()
+
+        # اضافه کردن هندلرها
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_handler))
+        app.add_handler(CommandHandler("stats", stats_handler))
+        app.add_handler(CommandHandler("films", films_handler))
+        app.add_handler(CommandHandler("users", users_handler))
+        app.add_handler(CallbackQueryHandler(button_handler))
+
+        app.add_handler(MessageHandler(
+            filters.Chat(PRIVATE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL),
+            channel_post_handler
+        ))
+
+        logger.info("✅ ربات شروع به کار کرد")
+
+        # شروع polling
+        app.run_polling(drop_pending_updates=True)
+
+    except Exception as e:
+        logger.error(f"❌ خطا در راه‌اندازی ربات: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
