@@ -1,189 +1,204 @@
-import logging
-import sqlite3
-import secrets
-import string
+import json
+import time
+import asyncio
+from uuid import uuid4
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-from telegram.error import BadRequest, Forbidden
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
 
-# ==================== تنظیمات ====================
+# ----------------------- CONFIG -----------------------
 TOKEN = "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0"
-BOT_USERNAME = "Senderpfilesbot"          # بدون @
+BOT_USERNAME = "Senderpfilesbot"
 FORCE_CHANNEL_ID = -1002034901903
 CHANNEL_LINK = "https://t.me/betdesignernet"
 ADMIN_ID = 7321524568
 
-logging.basicConfig(level=logging.INFO)
+DB_FILE = "db.json"
 
-# ==================== دیتابیس ساده ====================
-db = sqlite3.connect("bot.db", check_same_thread=False)
-db.execute("CREATE TABLE IF NOT EXISTS files (key TEXT PRIMARY KEY, file_id TEXT, title TEXT)")
-db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, joined INTEGER DEFAULT 0)")
-db.execute("CREATE TABLE IF NOT EXISTS pending (user_id INTEGER, key TEXT, PRIMARY KEY(user_id, key))")
-db.commit()
+# ----------------------- DATABASE -----------------------
 
-def add_file(key, file_id, title=""):
-    db.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?)", (key, file_id, title))
-    db.commit()
-
-def get_file(key):
-    cur = db.execute("SELECT file_id, title FROM files WHERE key=?", (key,))
-    row = cur.fetchone()
-    return {"file_id": row[0], "title": row[1]} if row else None
-
-def user_joined(user_id):
-    db.execute("INSERT OR REPLACE INTO users VALUES (?, 1)", (user_id,))
-    db.commit()
-
-def is_joined(user_id):
-    cur = db.execute("SELECT joined FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    return row and row[0] == 1
-
-def add_pending(user_id, key):
-    db.execute("INSERT OR IGNORE INTO pending VALUES (?, ?)", (user_id, key))
-    db.commit()
-
-def remove_pending(user_id, key):
-    db.execute("DELETE FROM pending WHERE user_id=? AND key=?", (user_id, key))
-    db.commit()
-
-def get_pending(user_id):
-    cur = db.execute("SELECT key FROM pending WHERE user_id=?", (user_id,))
-    return [row[0] for row in cur.fetchall()]
-
-# ==================== کیبوردها ====================
-def join_kb(key=""):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("عضویت در کانال", url=CHANNEL_LINK),
-        InlineKeyboardButton("تأیید عضویت", callback_data=f"check_{key}")
-    ]])
-
-def main_kb():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("آمار", callback_data="stats"),
-        InlineKeyboardButton("راهنما", callback_data="help")
-    ]])
-
-# ==================== بررسی عضویت (درست و قطعی) ====================
-async def check_member(user_id):
+def load_db():
     try:
-        member = await app.bot.get_chat_member(FORCE_CHANNEL_ID, user_id)
-        return member.status in ("member", "administrator", "creator")
-    except BadRequest as e:
-        if "not found" in str(e):
-            return False
-    except Forbidden:
-        logging.error("ربات از کانال بن شده یا دسترسی نداره!")
-        return False
-    except Exception as e:
-        logging.error(f"خطا در چک عضویت: {e}")
-    return False
-
-# ==================== هندلرها ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    args = context.args
-
-    if args and args[0].startswith("vid_"):
-        key = args[0]
-
-        if not get_file(key):
-            await update.message.reply_text("فایل پیدا نشد یا حذف شده.", reply_markup=main_kb())
-            return
-
-        if is_joined(user.id):
-            await send_file(context, user.id, key)
-            return
-
-        add_pending(user.id, key)
-        await update.message.reply_text(
-            "برای دریافت فایل باید عضو کانال بشید:\n\n"
-            f"کانال: {CHANNEL_LINK}\n\n"
-            "بعد از عضویت روی «تأیید عضویت» بزنید",
-            reply_markup=join_kb(key)
-        )
-    else:
-        await update.message.reply_text(
-            f"سلام {user.first_name}!\n\n"
-            "لینک فایل رو برام بفرست تا فایل رو بگیری\n"
-            f"کانال: {CHANNEL_LINK}",
-            reply_markup=main_kb()
-        )
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
-    data = q.data
-
-    if data.startswith("check_"):
-        key = data[6:] or get_pending(user_id)[0] if get_pending(user_id) else None
-        if not key or not get_file(key):
-            await q.edit_message_text("لینک اشتباهه")
-            return
-
-        await q.edit_message_text("در حال چک کردن عضویت...")
-
-        if await check_member(user_id):
-            await q.edit_message_text("عضویت تأیید شد! در حال ارسال فایل...")
-            user_joined(user_id)
-            remove_pending(user_id, key)
-            await send_file(context, user_id, key)
-        else:
-            await q.edit_message_text(
-                "هنوز عضو کانال نیستی!\n\n"
-                "اول برو عضو کانال شو، بعد دوباره بزن «تأیید عضویت»",
-                reply_markup=join_kb(key)
-            )
-
-    elif data == "stats":
-        await q.edit_message_text("ربات فعاله", reply_markup=main_kb())
-    elif data == "help":
-        await q.edit_message_text("روی لینک فایل بزن → عضو کانال شو → تأیید عضویت → فایل میاد", reply_markup=main_kb())
-
-async def send_file(context, user_id, key):
-    data = get_file(key)
-    caption = f"{data['title']}\nکد: {key}\nکانال: {CHANNEL_LINK}"
-
-    try:
-        await context.bot.send_video(user_id, data["file_id"], caption=caption, reply_markup=main_kb())
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except:
-        await context.bot.send_document(user_id, data["file_id"], caption=caption, reply_markup=main_kb())
-    await context.bot.send_message(user_id, "فایل ارسال شد!")
+        return {"videos": {}, "users": []}
 
-# ==================== وقتی تو کانال فایل آپلود میشه ====================
-async def channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post
-    if msg.chat.id != FORCE_CHANNEL_ID:
+
+def save_db(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+db = load_db()
+
+# ----------------------- ADMIN PANEL -----------------------
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         return
 
-    file_id = None
-    title = "فایل"
+    total_users = len(db["users"])
+    total_videos = len(db["videos"])
 
-    if msg.video:
-        file_id = msg.video.file_id
-        title = msg.caption or "ویدیو"
-    elif msg.document:
-        file_id = msg.document.file_id
-        title = msg.caption or msg.document.file_name or "داکیومنت"
+    text = (
+        "📊 *پنل مدیریت*\n\n"
+        f"👥 تعداد کاربران: {total_users}\n"
+        f"🎞 تعداد ویدیوهای ذخیره‌شده: {total_videos}\n\n"
+        "برای استفاده از پنل از دکمه‌ها استفاده کن:"
+    )
 
-    if file_id:
-        key = "vid_" + secrets.token_hex(5)
-        add_file(key, file_id, title)
-        link = f"https://t.me/{BOT_USERNAME}?start={key}"
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"فایل جدید!\n\nعنوان: {title}\nلینک:\n{link}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("اشتراک لینک", url=link)]])
+    keyboard = [
+        [InlineKeyboardButton("📁 لیست ویدیوها", callback_data="admin_videos")],
+        [InlineKeyboardButton("👥 لیست کاربران", callback_data="admin_users")]
+    ]
+
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if query.data == "admin_videos":
+        txt = "🎞 *لیست ویدیوهای ذخیره شده:*\n\n"
+        for key in db["videos"]:
+            txt += f"• {key}\n"
+        await query.message.reply_text(txt, parse_mode="Markdown")
+
+    elif query.data == "admin_users":
+        txt = "👥 *لیست کاربران:*\n\n"
+        for u in db["users"]:
+            txt += f"• {u}\n"
+        await query.message.reply_text(txt, parse_mode="Markdown")
+
+# ----------------------- VIDEO CAPTURE FROM CHANNEL -----------------------
+
+async def save_channel_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    chat_id = message.chat.id
+
+    if chat_id != FORCE_CHANNEL_ID:
+        return
+
+    # detect video/document-video
+    if not message.video and not (
+        message.document and message.document.mime_type.startswith("video")
+    ):
+        return
+
+    message_id = message.message_id
+    key = "v_" + uuid4().hex[:10]
+
+    db["videos"][key] = {"message_id": message_id}
+    save_db(db)
+
+    link = f"https://t.me/{BOT_USERNAME}?start={key}"
+
+    await message.reply_text(f"لینک اختصاصی این ویدیو:\n{link}")
+
+# ----------------------- USER START -----------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # add user to database
+    if user.id not in db["users"]:
+        db["users"].append(user.id)
+        save_db(db)
+
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("برای دریافت ویدیو از لینک اختصاصی استفاده کن.")
+        return
+
+    key = args[0]
+
+    if key not in db["videos"]:
+        await update.message.reply_text("لینک نامعتبر است یا حذف شده.")
+        return
+
+    await check_membership_and_send(update, context, key)
+
+# ----------------------- CHECK MEMBERSHIP -----------------------
+
+async def check_membership_and_send(update, context, key):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    try:
+        member = await context.bot.get_chat_member(FORCE_CHANNEL_ID, user_id)
+        if member.status not in ["member", "administrator", "creator"]:
+            raise Exception("Not joined")
+
+    except:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 عضویت در کانال", url=CHANNEL_LINK)],
+            [InlineKeyboardButton("🔁 بررسی عضویت", callback_data=f"check_{key}")]
+        ])
+
+        await update.message.reply_text(
+            "برای دریافت ویدیو ابتدا عضو کانال شو:",
+            reply_markup=keyboard
         )
+        return
 
-# ==================== اجرا ====================
-app = Application.builder().token(TOKEN).build()
+    # send video and delete after 30 seconds
+    msg = await context.bot.forward_message(
+        chat_id=chat_id,
+        from_chat_id=FORCE_CHANNEL_ID,
+        message_id=db["videos"][key]["message_id"]
+    )
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button))
-app.add_handler(MessageHandler(filters.CHAT_TYPE_CHANNEL & (filters.VIDEO | filters.DOCUMENT), channel_handler))
+    await asyncio.sleep(30)
+    try:
+        await context.bot.delete_message(chat_id, msg.message_id)
+    except:
+        pass
 
-print("ربات روشن شد...")
-app.run_polling(drop_pending_updates=True)
+# ----------------------- CALLBACK QUERY -----------------------
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data.startswith("check_"):
+        key = data.replace("check_", "")
+        await check_membership_and_send(query, context, key)
+
+    # admin panel buttons
+    await admin_buttons(update, context)
+
+# ----------------------- MAIN -----------------------
+
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin))
+
+    app.add_handler(MessageHandler(filters.ALL, save_channel_video))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    print("BOT RUNNING…")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
