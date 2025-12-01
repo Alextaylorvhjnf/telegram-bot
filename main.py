@@ -5,6 +5,7 @@ import secrets
 import string
 import asyncio
 from datetime import datetime, timedelta
+import sys
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
@@ -63,10 +64,8 @@ class PermanentDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 video_key TEXT,
-                access_type TEXT, -- 'view' یا 'download'
-                accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES permanent_users(user_id),
-                FOREIGN KEY (video_key) REFERENCES permanent_videos(unique_key)
+                access_type TEXT,
+                accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -77,8 +76,7 @@ class PermanentDatabase:
                 video_key TEXT UNIQUE,
                 permanent_url TEXT UNIQUE,
                 short_code TEXT UNIQUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (video_key) REFERENCES permanent_videos(unique_key)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -103,7 +101,7 @@ class PermanentDatabase:
             
             # ایجاد لینک همیشگی
             permanent_url = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
-            short_code = unique_key  # می‌توانید کد کوتاه‌تر ایجاد کنید
+            short_code = unique_key
             
             self.conn.execute('''
                 INSERT OR REPLACE INTO permanent_links 
@@ -354,7 +352,6 @@ async def send_permanent_video(context, user_id, video_key, message_to_edit=None
                 parse_mode='Markdown',
                 supports_streaming=True
             )
-            sent_as_video = True
         except BadRequest:
             # اگر ویدیو نبود، به عنوان سند ارسال کن
             await context.bot.send_document(
@@ -363,7 +360,6 @@ async def send_permanent_video(context, user_id, video_key, message_to_edit=None
                 caption=caption,
                 parse_mode='Markdown'
             )
-            sent_as_video = False
         
         # پیام تأیید ارسال
         success_text = (
@@ -403,6 +399,9 @@ async def send_permanent_video(context, user_id, video_key, message_to_edit=None
 # ==================== هندلر استارت با لینک همیشگی ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user:
+        return
+    
     user_id = user.id
     
     logging.info(f"🚀 کاربر {user_id} دستور /start را اجرا کرد")
@@ -602,34 +601,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== آپلود فایل همیشگی ====================
 async def handle_permanent_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """آپلود فایل جدید با لینک همیشگی"""
-    user_id = update.effective_user.id
+    # بررسی وجود کاربر
+    if update.effective_user is None:
+        # ممکن است از کانال باشد
+        if update.channel_post and update.channel_post.sender_chat:
+            # اگر از کانال است، از آیدی کانال استفاده کنیم
+            user_id = update.channel_post.sender_chat.id
+            message = update.channel_post
+        else:
+            # اگر کاربری وجود ندارد، خروج
+            return
+    else:
+        user_id = update.effective_user.id
+        message = update.message
     
+    # بررسی دسترسی ادمین
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ این قابلیت فقط برای ادمین در دسترس است.")
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text("❌ این قابلیت فقط برای ادمین در دسترس است.")
         return
     
-    message = update.message
+    # بررسی وجود پیام
+    if not message:
+        return
     
     # بررسی نوع پیام
-    if message.video:
+    file_obj = None
+    file_type = None
+    
+    if hasattr(message, 'video') and message.video:
         file_obj = message.video
         file_type = "video"
-    elif message.document:
+    elif hasattr(message, 'document') and message.document:
         file_obj = message.document
         file_type = "document"
-    elif message.photo:
+    elif hasattr(message, 'photo') and message.photo:
         # برای عکس‌ها، آخرین عکس (با کیفیت بالاتر)
         file_obj = message.photo[-1]
         file_type = "photo"
     else:
-        await update.message.reply_text(
-            "❌ لطفاً یک فایل (ویدیو، سند یا عکس) ارسال کنید.\n\n"
-            "📝 **نکته:** می‌توانید برای فایل توضیح نیز ارسال کنید."
-        )
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(
+                "❌ لطفاً یک فایل (ویدیو، سند یا عکس) ارسال کنید.\n\n"
+                "📝 **نکته:** می‌توانید برای فایل توضیح نیز ارسال کنید."
+            )
         return
     
     file_id = file_obj.file_id
-    title = message.caption or file_obj.file_name or "فایل بدون عنوان"
+    title = message.caption or (file_obj.file_name if hasattr(file_obj, 'file_name') else "فایل بدون عنوان")
     
     # تولید کلید یکتا برای لینک همیشگی
     unique_key = generate_permanent_key()
@@ -663,22 +682,25 @@ async def handle_permanent_upload(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("📊 مشاهده آمار", callback_data=f"stats_{unique_key}")]
         ])
         
-        await update.message.reply_text(
-            response_text,
-            parse_mode='Markdown',
-            reply_markup=keyboard
-        )
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(
+                response_text,
+                parse_mode='Markdown',
+                reply_markup=keyboard
+            )
         
         logging.info(f"✅ فایل همیشگی جدید ذخیره شد: {unique_key}")
     else:
-        await update.message.reply_text(
-            "❌ خطا در ذخیره فایل. لطفاً دوباره تلاش کنید.\n\n"
-            "⚠️ ممکن است فایل تکراری باشد یا مشکلی در دیتابیس وجود داشته باشد."
-        )
+        error_msg = "❌ خطا در ذخیره فایل. لطفاً دوباره تلاش کنید.\n\n⚠️ ممکن است فایل تکراری باشد یا مشکلی در دیتابیس وجود داشته باشد."
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(error_msg)
 
 # ==================== دستورات ادمین ====================
 async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دستور آمار ادمین"""
+    if update.effective_user is None:
+        return
+    
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
@@ -740,6 +762,9 @@ async def admin_stats_callback(message_or_query):
 
 async def list_videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """لیست تمام فایل‌های همیشگی"""
+    if update.effective_user is None:
+        return
+    
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
@@ -788,6 +813,9 @@ async def list_videos_callback(message_or_query):
 
 async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """جستجو در فایل‌ها"""
+    if update.effective_user is None:
+        return
+    
     if not context.args:
         await update.message.reply_text(
             "🔍 **لطفاً کلیدواژه جستجو را وارد کنید:**\n\n"
@@ -828,6 +856,9 @@ async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """نمایش تمام فایل‌های موجود"""
+    if update.effective_user is None:
+        return
+    
     videos = db.get_all_permanent_videos()
     
     if not videos:
@@ -858,6 +889,9 @@ async def show_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_file_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دریافت اطلاعات یک فایل"""
+    if update.effective_user is None:
+        return
+    
     if not context.args:
         await update.message.reply_text(
             "📄 **لطفاً کلید فایل را وارد کنید:**\n\n"
@@ -920,8 +954,14 @@ def main():
     print("🔗 ویژگی: لینک‌های همیشگی - فایل‌ها هرگز حذف نمی‌شوند!")
     print("=" * 60)
     
-    # ایجاد اپلیکیشن
-    app = Application.builder().token(TOKEN).build()
+    # ایجاد اپلیکیشن با تنظیمات جدید (بدون هشدار deprecation)
+    app = Application.builder() \
+        .token(TOKEN) \
+        .get_updates_read_timeout(30) \
+        .get_updates_write_timeout(30) \
+        .get_updates_connect_timeout(30) \
+        .get_updates_pool_timeout(30) \
+        .build()
     
     # هندلرهای اصلی
     app.add_handler(CommandHandler("start", start))
@@ -955,19 +995,17 @@ def main():
     print("🔄 در حال اتصال به سرور تلگرام...")
     
     try:
+        # استفاده از run_polling بدون پارامترهای deprecated
         app.run_polling(
             drop_pending_updates=True,
-            timeout=30,
-            pool_timeout=30,
-            connect_timeout=30,
-            read_timeout=30,
-            write_timeout=30,
             allowed_updates=Update.ALL_TYPES
         )
     except KeyboardInterrupt:
         print("\n🛑 ربات توسط کاربر متوقف شد.")
     except Exception as e:
         print(f"❌ خطا در اجرای ربات: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
