@@ -1,10 +1,13 @@
 import os
+import sys
 import logging
 import sqlite3
 import secrets
 import string
 import asyncio
+import signal
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
@@ -20,6 +23,53 @@ FORCE_CHANNEL_LINK = "https://t.me/betdesignernet/132"
 CHANNEL_USERNAME = "@betdesignernet"
 
 ADMIN_ID = 7321524568
+
+# فایل قفل برای جلوگیری از اجرای چندگانه
+LOCK_FILE = "bot.lock"
+
+# ==================== مدیریت قفل ====================
+def create_lock():
+    """ایجاد فایل قفل برای جلوگیری از اجرای چندگانه"""
+    try:
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        logging.info(f"🔒 فایل قفل ایجاد شد: {LOCK_FILE}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ خطا در ایجاد فایل قفل: {e}")
+        return False
+
+def remove_lock():
+    """حذف فایل قفل"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            logging.info("🔓 فایل قفل حذف شد")
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف فایل قفل: {e}")
+
+def check_lock():
+    """بررسی وجود فایل قفل"""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                pid = f.read().strip()
+            logging.warning(f"⚠️ فایل قفل موجود است (PID: {pid})")
+            return True
+        except:
+            return True
+    return False
+
+# ==================== مدیریت سیگنال‌ها ====================
+def signal_handler(signum, frame):
+    """مدیریت سیگنال‌های خاتمه"""
+    logging.info("🛑 دریافت سیگنال خاتمه...")
+    remove_lock()
+    sys.exit(0)
+
+# ثبت هندلر سیگنال‌ها
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # ==================== دیتابیس ====================
 class Database:
@@ -108,23 +158,6 @@ class Database:
         cursor = self.conn.execute('SELECT unique_key, title, view_count FROM videos WHERE is_active = 1 ORDER BY created_at DESC')
         return cursor.fetchall()
     
-    def get_video_by_permanent_link(self, permanent_link):
-        cursor = self.conn.execute('''
-            SELECT v.file_id, v.title, v.view_count, v.unique_key 
-            FROM videos v 
-            JOIN permanent_links pl ON v.unique_key = pl.video_key 
-            WHERE pl.permanent_link = ? AND v.is_active = 1
-        ''', (permanent_link,))
-        result = cursor.fetchone()
-        if result:
-            return {
-                'file_id': result[0], 
-                'title': result[1], 
-                'view_count': result[2],
-                'unique_key': result[3]
-            }
-        return None
-    
     def increment_view_count(self, unique_key):
         self.conn.execute('UPDATE videos SET view_count = view_count + 1 WHERE unique_key = ?', (unique_key,))
         self.conn.commit()
@@ -178,8 +211,7 @@ def create_join_keyboard(video_key=None):
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
-        [InlineKeyboardButton("📊 آمار ادمین", callback_data="admin_stats")]
+        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
     ])
 
 # ==================== بررسی عضویت ====================
@@ -208,44 +240,6 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
         logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت: {e}")
         return False
 
-# ==================== حذف دستی پیام‌های قدیمی ====================
-async def manual_delete_old_messages(context: ContextTypes.DEFAULT_TYPE):
-    """حذف دستی پیام‌های قدیمی - جایگزین JobQueue"""
-    try:
-        sent_messages = db.get_sent_messages()
-        current_time = datetime.now()
-        
-        for msg_id, user_id, message_id, video_key in sent_messages:
-            try:
-                # چک کردن زمان ارسال پیام
-                cursor = db.conn.execute('SELECT sent_at FROM sent_messages WHERE message_id = ?', (message_id,))
-                result = cursor.fetchone()
-                
-                if result:
-                    sent_at = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
-                    time_diff = (current_time - sent_at).total_seconds()
-                    
-                    # اگر بیشتر از 30 ثانیه گذشته باشد
-                    if time_diff > 30:
-                        # حذف پیام از چت کاربر
-                        await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-                        logging.info(f"✅ پیام {message_id} برای کاربر {user_id} حذف شد (زمان سپری شده: {int(time_diff)} ثانیه)")
-                        
-                        # حذف از دیتابیس
-                        db.delete_sent_message(message_id)
-                
-            except BadRequest as e:
-                if "Message to delete not found" in str(e):
-                    logging.info(f"⚠️ پیام {message_id} قبلاً حذف شده")
-                    db.delete_sent_message(message_id)
-                else:
-                    logging.error(f"❌ خطا در حذف پیام {message_id}: {e}")
-            except Exception as e:
-                logging.error(f"❌ خطای غیرمنتظره در حذف پیام: {e}")
-                
-    except Exception as e:
-        logging.error(f"❌ خطا در حذف دستی پیام‌ها: {e}")
-
 # ==================== ارسال فایل به کاربر ====================
 async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
     try:
@@ -261,18 +255,9 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
         file_id = video_data['file_id']
         title = video_data['title'] or "فایل شما"
         
-        # پیام هشدار
-        warning_message = await context.bot.send_message(
-            user_id,
-            "⚠️ **توجه**: این فایل 30 ثانیه دیگر به طور خودکار حذف خواهد شد.\n"
-            "💾 بهتر است آن را ذخیره کنید!",
-            parse_mode='Markdown'
-        )
-        
-        # ارسال فایل با کپشن ساده (بدون آمار)
+        # ارسال فایل با کپشن ساده
         caption = (
             f"🎬 **{title}**\n\n"
-            f"⏰ این فایل 30 ثانیه دیگر حذف می‌شود!\n"
             f"💾 برای استفاده بعدی، حتماً ذخیره کنید.\n\n"
             f"🔗 **لینک همیشگی این فایل:**\n"
             f"`https://t.me/{BOT_USERNAME}?start=video_{video_key}`"
@@ -293,18 +278,13 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
                 parse_mode='Markdown'
             )
         
-        # ذخیره اطلاعات پیام برای حذف خودکار
-        db.save_sent_message(user_id, sent_message.message_id, video_key)
-        db.save_sent_message(user_id, warning_message.message_id, video_key)
-        
         # به‌روزرسانی آمار
         db.increment_view_count(video_key)
         db.increment_user_downloads(user_id)
         db.record_user_view(user_id, video_key)
         
         success_text = (
-            "✅ فایل با موفقیت ارسال شد!\n"
-            "⚠️ یادت نره ذخیره‌اش کنی، 30 ثانیه دیگه حذف میشه!\n\n"
+            "✅ فایل با موفقیت ارسال شد!\n\n"
             f"🔗 **لینک همیشگی:**\n"
             f"`https://t.me/{BOT_USERNAME}?start=video_{video_key}`"
         )
@@ -312,17 +292,6 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
             await message_to_edit.edit_text(success_text, parse_mode='Markdown')
         else:
             await context.bot.send_message(user_id, success_text, parse_mode='Markdown')
-        
-        # برنامه‌ریزی حذف خودکار بعد از 30 ثانیه (بدون JobQueue)
-        await asyncio.sleep(30)
-        try:
-            await context.bot.delete_message(chat_id=user_id, message_id=sent_message.message_id)
-            await context.bot.delete_message(chat_id=user_id, message_id=warning_message.message_id)
-            db.delete_sent_message(sent_message.message_id)
-            db.delete_sent_message(warning_message.message_id)
-            logging.info(f"✅ فایل {video_key} برای کاربر {user_id} بعد از 30 ثانیه حذف شد")
-        except Exception as e:
-            logging.error(f"❌ خطا در حذف خودکار فایل: {e}")
         
         logging.info(f"✅ فایل {video_key} برای کاربر {user_id} ارسال شد")
         
@@ -385,7 +354,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"به ربات دریافت فایل خوش آمدید.\n\n"
             f"🎬 برای دریافت فایل روی لینک مخصوص کلیک کنید.\n"
             f"📢 کانال: {CHANNEL_USERNAME}\n\n"
-            f"⚠️ توجه: فایل‌ها 30 ثانیه پس از ارسال به طور خودکار حذف می‌شوند!\n"
             f"🔗 لینک‌های فایل‌ها همیشگی هستند و منقضی نمی‌شوند!",
             reply_markup=get_main_keyboard()
         )
@@ -439,7 +407,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "3. روی دکمه تأیید عضویت کلیک کنید\n"
             "4. فایل دریافت می‌شود\n\n"
             "⚠️ **توجه مهم:**\n"
-            "• فایل‌ها 30 ثانیه پس از ارسال حذف می‌شوند\n"
             "• حتماً فایل را ذخیره کنید\n"
             "• اگر از کانال لفت بدید، فایل دریافت نمی‌کنید\n"
             "• لینک‌های فایل همیشگی هستند و منقضی نمی‌شوند\n\n"
@@ -447,12 +414,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown',
             reply_markup=get_main_keyboard()
         )
-    
-    elif data == "admin_stats":
-        if user_id == ADMIN_ID:
-            await admin_stats_callback(update, context)
-        else:
-            await query.edit_message_text("❌ این دستور فقط برای ادمین است.")
 
 # ==================== آپلود فایل در چت خصوصی با ربات ====================
 async def handle_private_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -511,10 +472,6 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
-    await admin_stats_callback(update, context)
-
-async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تابع مشترک برای نمایش آمار ادمین"""
     # جمع‌آوری آمار کامل
     videos = db.get_all_videos()
     
@@ -529,11 +486,7 @@ async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     
     stats_text += f"👁️ **تعداد کل بازدیدها:** {total_views}"
     
-    # اگر از کال‌بک استفاده می‌شود
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(stats_text, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(stats_text, parse_mode='Markdown')
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
 
 async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """لیست تمام ویدیوها با لینک‌های ثابت"""
@@ -584,16 +537,17 @@ async def delete_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ فایل با کد `{video_key}` غیرفعال شد.", parse_mode='Markdown')
 
-async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پاکسازی پیام‌های قدیمی"""
+async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """توقف ربات"""
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
-    await manual_delete_old_messages(context)
-    await update.message.reply_text("✅ پاکسازی پیام‌های قدیمی انجام شد.")
+    await update.message.reply_text("🛑 ربات در حال توقف...")
+    remove_lock()
+    os._exit(0)
 
 # ==================== هندلر خطا ====================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -601,8 +555,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raise context.error
     except Conflict:
-        logging.error("❌ خطای Conflict: احتمالاً یک نمونه دیگر از ربات در حال اجرا است!")
-        logging.info("💡 راه‌حل: ابتدا ربات‌های در حال اجرا را متوقف کنید، سپس دوباره اجرا نمایید.")
+        logging.error("❌ خطای Conflict: یک نمونه دیگر از ربات در حال اجرا است!")
+        logging.info("💡 راه‌حل: ابتدا ربات‌های در حال اجرا را متوقف کنید")
     except BadRequest as e:
         logging.error(f"❌ خطای BadRequest: {e}")
     except Exception as e:
@@ -610,21 +564,34 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== اجرای ربات ====================
 def main():
+    # تنظیمات لاگ
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         level=logging.INFO
     )
     
-    logging.info("🚀 شروع ربات...")
-    logging.info(f"📢 کانال ID: {FORCE_CHANNEL_ID}")
-    logging.info(f"🔗 لینک کانال: {FORCE_CHANNEL_LINK}")
-    logging.info(f"🤖 نام ربات: {BOT_USERNAME}")
-    logging.info(f"👑 ادمین اصلی: {ADMIN_ID}")
+    print("=" * 50)
+    print("🤖 ربات ارسال فایل با لینک‌های همیشگی")
+    print("=" * 50)
+    print(f"📱 نام ربات: {BOT_USERNAME}")
+    print(f"👑 ادمین: {ADMIN_ID}")
+    print(f"📢 کانال: {CHANNEL_USERNAME}")
+    print("=" * 50)
     
-    # اطمینان از توقف ربات‌های قبلی
-    logging.info("🛑 بررسی ربات‌های در حال اجرا...")
+    # بررسی فایل قفل
+    if check_lock():
+        print("❌ ربات در حال حاضر در حال اجرا است!")
+        print("💡 اگر مطمئنید که اجرا نیست، فایل 'bot.lock' را حذف کنید")
+        sys.exit(1)
+    
+    # ایجاد فایل قفل
+    if not create_lock():
+        print("❌ خطا در ایجاد فایل قفل")
+        sys.exit(1)
     
     try:
+        logging.info("🚀 شروع ربات...")
+        
         app = Application.builder().token(TOKEN).build()
         
         # اضافه کردن هندلر خطا
@@ -635,7 +602,7 @@ def main():
         app.add_handler(CommandHandler("stats", admin_stats))
         app.add_handler(CommandHandler("list", list_videos))
         app.add_handler(CommandHandler("delete", delete_video))
-        app.add_handler(CommandHandler("cleanup", cleanup))
+        app.add_handler(CommandHandler("stop", stop_bot))
         app.add_handler(CommandHandler("upload", handle_private_upload))
         app.add_handler(CallbackQueryHandler(button_handler))
         
@@ -646,26 +613,32 @@ def main():
         ))
         
         logging.info("✅ ربات آماده است و در حال اجرا...")
-        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        
+        # اجرای ربات
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Conflict as e:
-        logging.error("❌ خطای Conflict! احتمالاً ربات در جای دیگری در حال اجرا است.")
-        logging.info("💡 راه‌حل‌های ممکن:")
-        logging.info("1. در سرور دیگر، ربات را متوقف کنید")
-        logging.info("2. اگر روی کامپیوتر شخصی اجرا می‌کنید، مطمئن شوید فقط یک نمونه در حال اجرا است")
-        logging.info("3. چند دقیقه صبر کنید و دوباره امتحان کنید")
-    
+        logging.error("❌ خطای Conflict! ربات قبلاً در حال اجرا است.")
+        remove_lock()
+        print("\n🔥 راه‌حل:")
+        print("1. اگر روی کامپیوتر شخصی هستید، ترمینال‌های قبلی را ببندید")
+        print("2. دستور 'pkill -f python' را اجرا کنید")
+        print("3. اگر فایل bot.lock وجود دارد، آن را حذف کنید")
+        print("4. دوباره ربات را اجرا کنید")
+        
+    except KeyboardInterrupt:
+        logging.info("🛑 ربات توسط کاربر متوقف شد")
+        remove_lock()
+        
     except Exception as e:
         logging.error(f"❌ خطای غیرمنتظره: {e}")
+        remove_lock()
+        
+    finally:
+        remove_lock()
 
 if __name__ == "__main__":
-    # بررسی ربات‌های در حال اجرا
-    print("=" * 50)
-    print("🤖 ربات ارسال فایل با لینک‌های همیشگی")
-    print("=" * 50)
-    print(f"📱 نام ربات: {BOT_USERNAME}")
-    print(f"👑 ادمین: {ADMIN_ID}")
-    print(f"📢 کانال: {CHANNEL_USERNAME}")
-    print("=" * 50)
-    
     main()
