@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # ==================== تنظیمات ====================
 TOKEN = "8519774430:AAG-E3bs-jswXYYhpkohnHyhbh_KjoRETh0"
@@ -208,21 +208,31 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
         logging.error(f"❌ خطای غیرمنتظره در بررسی عضویت: {e}")
         return False
 
-# ==================== حذف خودکار پیام‌ها ====================
-async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE):
-    """حذف خودکار پیام‌های ارسال شده بعد از 30 ثانیه"""
+# ==================== حذف دستی پیام‌های قدیمی ====================
+async def manual_delete_old_messages(context: ContextTypes.DEFAULT_TYPE):
+    """حذف دستی پیام‌های قدیمی - جایگزین JobQueue"""
     try:
         sent_messages = db.get_sent_messages()
         current_time = datetime.now()
         
         for msg_id, user_id, message_id, video_key in sent_messages:
             try:
-                # حذف پیام از چت کاربر
-                await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-                logging.info(f"✅ پیام {message_id} برای کاربر {user_id} حذف شد")
+                # چک کردن زمان ارسال پیام
+                cursor = db.conn.execute('SELECT sent_at FROM sent_messages WHERE message_id = ?', (message_id,))
+                result = cursor.fetchone()
                 
-                # حذف از دیتابیس
-                db.delete_sent_message(message_id)
+                if result:
+                    sent_at = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+                    time_diff = (current_time - sent_at).total_seconds()
+                    
+                    # اگر بیشتر از 30 ثانیه گذشته باشد
+                    if time_diff > 30:
+                        # حذف پیام از چت کاربر
+                        await context.bot.delete_message(chat_id=user_id, message_id=message_id)
+                        logging.info(f"✅ پیام {message_id} برای کاربر {user_id} حذف شد (زمان سپری شده: {int(time_diff)} ثانیه)")
+                        
+                        # حذف از دیتابیس
+                        db.delete_sent_message(message_id)
                 
             except BadRequest as e:
                 if "Message to delete not found" in str(e):
@@ -234,7 +244,7 @@ async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"❌ خطای غیرمنتظره در حذف پیام: {e}")
                 
     except Exception as e:
-        logging.error(f"❌ خطا در حذف خودکار پیام‌ها: {e}")
+        logging.error(f"❌ خطا در حذف دستی پیام‌ها: {e}")
 
 # ==================== ارسال فایل به کاربر ====================
 async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
@@ -303,7 +313,7 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
         else:
             await context.bot.send_message(user_id, success_text, parse_mode='Markdown')
         
-        # برنامه‌ریزی حذف خودکار بعد از 30 ثانیه
+        # برنامه‌ریزی حذف خودکار بعد از 30 ثانیه (بدون JobQueue)
         await asyncio.sleep(30)
         try:
             await context.bot.delete_message(chat_id=user_id, message_id=sent_message.message_id)
@@ -574,23 +584,29 @@ async def delete_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ فایل با کد `{video_key}` غیرفعال شد.", parse_mode='Markdown')
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ارسال پیام به همه کاربران"""
+async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پاکسازی پیام‌های قدیمی"""
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
-    if not context.args:
-        await update.message.reply_text("لطفاً پیام را وارد کنید: /broadcast <پیام>")
-        return
-    
-    broadcast_message = ' '.join(context.args)
-    
-    # این بخش نیاز به پیاده‌سازی جدول users دارد
-    # فعلاً فقط پیام تایید ارسال می‌شود
-    await update.message.reply_text("✅ پیام برای ارسال به کاربران آماده است.")
+    await manual_delete_old_messages(context)
+    await update.message.reply_text("✅ پاکسازی پیام‌های قدیمی انجام شد.")
+
+# ==================== هندلر خطا ====================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هندلر خطاهای ربات"""
+    try:
+        raise context.error
+    except Conflict:
+        logging.error("❌ خطای Conflict: احتمالاً یک نمونه دیگر از ربات در حال اجرا است!")
+        logging.info("💡 راه‌حل: ابتدا ربات‌های در حال اجرا را متوقف کنید، سپس دوباره اجرا نمایید.")
+    except BadRequest as e:
+        logging.error(f"❌ خطای BadRequest: {e}")
+    except Exception as e:
+        logging.error(f"❌ خطای غیرمنتظره: {e}")
 
 # ==================== اجرای ربات ====================
 def main():
@@ -603,31 +619,53 @@ def main():
     logging.info(f"📢 کانال ID: {FORCE_CHANNEL_ID}")
     logging.info(f"🔗 لینک کانال: {FORCE_CHANNEL_LINK}")
     logging.info(f"🤖 نام ربات: {BOT_USERNAME}")
+    logging.info(f"👑 ادمین اصلی: {ADMIN_ID}")
     
-    app = Application.builder().token(TOKEN).build()
+    # اطمینان از توقف ربات‌های قبلی
+    logging.info("🛑 بررسی ربات‌های در حال اجرا...")
     
-    # هندلرها
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", admin_stats))
-    app.add_handler(CommandHandler("list", list_videos))
-    app.add_handler(CommandHandler("delete", delete_video))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("upload", handle_private_upload))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    try:
+        app = Application.builder().token(TOKEN).build()
+        
+        # اضافه کردن هندلر خطا
+        app.add_error_handler(error_handler)
+        
+        # هندلرها
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("stats", admin_stats))
+        app.add_handler(CommandHandler("list", list_videos))
+        app.add_handler(CommandHandler("delete", delete_video))
+        app.add_handler(CommandHandler("cleanup", cleanup))
+        app.add_handler(CommandHandler("upload", handle_private_upload))
+        app.add_handler(CallbackQueryHandler(button_handler))
+        
+        # هندلر آپلود فایل در چت خصوصی
+        app.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & (filters.VIDEO | filters.Document.ALL), 
+            handle_private_upload
+        ))
+        
+        logging.info("✅ ربات آماده است و در حال اجرا...")
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        
+    except Conflict as e:
+        logging.error("❌ خطای Conflict! احتمالاً ربات در جای دیگری در حال اجرا است.")
+        logging.info("💡 راه‌حل‌های ممکن:")
+        logging.info("1. در سرور دیگر، ربات را متوقف کنید")
+        logging.info("2. اگر روی کامپیوتر شخصی اجرا می‌کنید، مطمئن شوید فقط یک نمونه در حال اجرا است")
+        logging.info("3. چند دقیقه صبر کنید و دوباره امتحان کنید")
     
-    # هندلر آپلود فایل در چت خصوصی
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & (filters.VIDEO | filters.Document.ALL), 
-        handle_private_upload
-    ))
-    
-    # Job Queue برای حذف خودکار پیام‌های قدیمی
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(delete_old_messages, interval=60, first=10)  # هر 1 دقیقه چک کن
-    
-    logging.info("✅ ربات آماده است")
-    app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        logging.error(f"❌ خطای غیرمنتظره: {e}")
 
 if __name__ == "__main__":
+    # بررسی ربات‌های در حال اجرا
+    print("=" * 50)
+    print("🤖 ربات ارسال فایل با لینک‌های همیشگی")
+    print("=" * 50)
+    print(f"📱 نام ربات: {BOT_USERNAME}")
+    print(f"👑 ادمین: {ADMIN_ID}")
+    print(f"📢 کانال: {CHANNEL_USERNAME}")
+    print("=" * 50)
+    
     main()
