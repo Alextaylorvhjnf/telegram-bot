@@ -35,7 +35,8 @@ class Database:
                 file_id TEXT,
                 title TEXT,
                 view_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1
             )
         ''')
         self.conn.execute('''
@@ -64,6 +65,14 @@ class Database:
                 sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS permanent_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_key TEXT UNIQUE,
+                permanent_link TEXT UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         self.conn.commit()
         logging.info("✅ دیتابیس آماده است")
     
@@ -71,6 +80,12 @@ class Database:
         try:
             self.conn.execute('INSERT INTO videos (unique_key, file_id, title) VALUES (?, ?, ?)', 
                             (unique_key, file_id, title))
+            
+            # ایجاد لینک همیشگی
+            permanent_link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
+            self.conn.execute('INSERT OR REPLACE INTO permanent_links (video_key, permanent_link) VALUES (?, ?)', 
+                            (unique_key, permanent_link))
+            
             self.conn.commit()
             logging.info(f"✅ ویدیو با کد {unique_key} ذخیره شد")
             return True
@@ -79,7 +94,7 @@ class Database:
             return False
     
     def get_video(self, unique_key):
-        cursor = self.conn.execute('SELECT file_id, title, view_count FROM videos WHERE unique_key = ?', (unique_key,))
+        cursor = self.conn.execute('SELECT file_id, title, view_count FROM videos WHERE unique_key = ? AND is_active = 1', (unique_key,))
         result = cursor.fetchone()
         if result:
             return {
@@ -90,8 +105,25 @@ class Database:
         return None
     
     def get_all_videos(self):
-        cursor = self.conn.execute('SELECT unique_key, title, view_count FROM videos ORDER BY created_at DESC')
+        cursor = self.conn.execute('SELECT unique_key, title, view_count FROM videos WHERE is_active = 1 ORDER BY created_at DESC')
         return cursor.fetchall()
+    
+    def get_video_by_permanent_link(self, permanent_link):
+        cursor = self.conn.execute('''
+            SELECT v.file_id, v.title, v.view_count, v.unique_key 
+            FROM videos v 
+            JOIN permanent_links pl ON v.unique_key = pl.video_key 
+            WHERE pl.permanent_link = ? AND v.is_active = 1
+        ''', (permanent_link,))
+        result = cursor.fetchone()
+        if result:
+            return {
+                'file_id': result[0], 
+                'title': result[1], 
+                'view_count': result[2],
+                'unique_key': result[3]
+            }
+        return None
     
     def increment_view_count(self, unique_key):
         self.conn.execute('UPDATE videos SET view_count = view_count + 1 WHERE unique_key = ?', (unique_key,))
@@ -124,6 +156,12 @@ class Database:
     def delete_sent_message(self, message_id):
         self.conn.execute('DELETE FROM sent_messages WHERE message_id = ?', (message_id,))
         self.conn.commit()
+    
+    def deactivate_video(self, unique_key):
+        """غیرفعال کردن ویدیو (به جای حذف کامل)"""
+        self.conn.execute('UPDATE videos SET is_active = 0 WHERE unique_key = ?', (unique_key,))
+        self.conn.commit()
+        logging.info(f"✅ ویدیو با کد {unique_key} غیرفعال شد")
 
 db = Database()
 
@@ -140,7 +178,8 @@ def create_join_keyboard(video_key=None):
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
+        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
+        [InlineKeyboardButton("📊 آمار ادمین", callback_data="admin_stats")]
     ])
 
 # ==================== بررسی عضویت ====================
@@ -202,7 +241,7 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
     try:
         video_data = db.get_video(video_key)
         if not video_data:
-            error_text = "❌ فایل مورد نظر پیدا نشد."
+            error_text = "❌ فایل مورد نظر پیدا نشد. ممکن است حذف شده باشد."
             if message_to_edit:
                 await message_to_edit.edit_text(error_text)
             else:
@@ -224,7 +263,9 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
         caption = (
             f"🎬 **{title}**\n\n"
             f"⏰ این فایل 30 ثانیه دیگر حذف می‌شود!\n"
-            f"💾 برای استفاده بعدی، حتماً ذخیره کنید."
+            f"💾 برای استفاده بعدی، حتماً ذخیره کنید.\n\n"
+            f"🔗 **لینک همیشگی این فایل:**\n"
+            f"`https://t.me/{BOT_USERNAME}?start=video_{video_key}`"
         )
         
         try:
@@ -251,11 +292,16 @@ async def send_video_to_user(context, user_id, video_key, message_to_edit=None):
         db.increment_user_downloads(user_id)
         db.record_user_view(user_id, video_key)
         
-        success_text = "✅ فایل با موفقیت ارسال شد!\n⚠️ یادت نره ذخیره‌اش کنی، 30 ثانیه دیگه حذف میشه!"
+        success_text = (
+            "✅ فایل با موفقیت ارسال شد!\n"
+            "⚠️ یادت نره ذخیره‌اش کنی، 30 ثانیه دیگه حذف میشه!\n\n"
+            f"🔗 **لینک همیشگی:**\n"
+            f"`https://t.me/{BOT_USERNAME}?start=video_{video_key}`"
+        )
         if message_to_edit:
-            await message_to_edit.edit_text(success_text)
+            await message_to_edit.edit_text(success_text, parse_mode='Markdown')
         else:
-            await context.bot.send_message(user_id, success_text)
+            await context.bot.send_message(user_id, success_text, parse_mode='Markdown')
         
         # برنامه‌ریزی حذف خودکار بعد از 30 ثانیه
         await asyncio.sleep(30)
@@ -316,8 +362,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔒 برای دریافت فایل، لطفاً در کانال ما عضو شوید:\n\n"
                     f"📢 {CHANNEL_USERNAME}\n\n"
                     f"✅ پس از عضویت، روی دکمه زیر کلیک کنید:\n\n"
-                    f"⚠️ توجه: اگر از کانال لفت بدید، فایل‌های بعدی براتون ارسال نمیشه!",
-                    reply_markup=create_join_keyboard(video_key)
+                    f"⚠️ توجه: اگر از کانال لفت بدید، فایل‌های بعدی براتون ارسال نمیشه!\n\n"
+                    f"🔗 **لینک همیشگی این فایل:**\n"
+                    f"`https://t.me/{BOT_USERNAME}?start=video_{video_key}`",
+                    reply_markup=create_join_keyboard(video_key),
+                    parse_mode='Markdown'
                 )
     else:
         # پیام خوشامدگویی معمولی
@@ -326,7 +375,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"به ربات دریافت فایل خوش آمدید.\n\n"
             f"🎬 برای دریافت فایل روی لینک مخصوص کلیک کنید.\n"
             f"📢 کانال: {CHANNEL_USERNAME}\n\n"
-            f"⚠️ توجه: فایل‌ها 30 ثانیه پس از ارسال به طور خودکار حذف می‌شوند!",
+            f"⚠️ توجه: فایل‌ها 30 ثانیه پس از ارسال به طور خودکار حذف می‌شوند!\n"
+            f"🔗 لینک‌های فایل‌ها همیشگی هستند و منقضی نمی‌شوند!",
             reply_markup=get_main_keyboard()
         )
 
@@ -363,8 +413,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• در کانال {CHANNEL_USERNAME} عضو شده‌اید\n"
                 f"• از اکانت درست استفاده می‌کنید\n\n"
                 f"⚠️ اگر از کانال لفت بدید، فایل‌های بعدی براتون ارسال نمیشه!\n\n"
-                f"🔗 لینک کانال: {FORCE_CHANNEL_LINK}",
-                reply_markup=create_join_keyboard(video_key)
+                f"🔗 لینک کانال: {FORCE_CHANNEL_LINK}\n\n"
+                f"🔗 **لینک همیشگی این فایل:**\n"
+                f"`https://t.me/{BOT_USERNAME}?start=video_{video_key}`",
+                reply_markup=create_join_keyboard(video_key),
+                parse_mode='Markdown'
             )
     
     elif data == "help":
@@ -378,18 +431,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ **توجه مهم:**\n"
             "• فایل‌ها 30 ثانیه پس از ارسال حذف می‌شوند\n"
             "• حتماً فایل را ذخیره کنید\n"
-            "• اگر از کانال لفت بدید، فایل دریافت نمی‌کنید\n\n"
+            "• اگر از کانال لفت بدید، فایل دریافت نمی‌کنید\n"
+            "• لینک‌های فایل همیشگی هستند و منقضی نمی‌شوند\n\n"
             f"📢 کانال: {CHANNEL_USERNAME}",
             parse_mode='Markdown',
             reply_markup=get_main_keyboard()
         )
+    
+    elif data == "admin_stats":
+        if user_id == ADMIN_ID:
+            await admin_stats_callback(update, context)
+        else:
+            await query.edit_message_text("❌ این دستور فقط برای ادمین است.")
 
-# ==================== هندلر آپلود فایل در کانال ====================
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.channel_post:
+# ==================== آپلود فایل در چت خصوصی با ربات ====================
+async def handle_private_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هندلر آپلود فایل در چت خصوصی با ربات"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ این قابلیت فقط برای ادمین است.")
         return
     
-    message = update.channel_post
+    message = update.message
     file_id = None
     file_type = None
     title = ""
@@ -403,32 +467,31 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_type = "document"
         title = message.caption or message.document.file_name or "فایل"
     else:
+        await update.message.reply_text("❌ لطفاً یک ویدیو یا فایل ارسال کنید.")
         return
     
-    # ایجاد یک کد ثابت برای هر فایل بر اساس محتوای آن
+    # ایجاد یک کد ثابت برای فایل
     unique_key = generate_key()
     
     if db.add_video(unique_key, file_id, title):
-        # لینک ثابت برای این فایل
+        # لینک همیشگی برای این فایل
         permanent_link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
         
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"📦 **فایل جدید ذخیره شد!**\n\n"
-                f"📁 نوع: {file_type}\n"
-                f"🔑 کد ثابت: `{unique_key}`\n"
-                f"📝 عنوان: {title}\n"
-                f"🔗 لینک ثابت:\n`{permanent_link}`\n\n"
-                f"💡 این لینک همیشگی است و منقضی نمی‌شود",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=permanent_link)
-                ]])
-            )
-            logging.info(f"✅ فایل جدید با کد ثابت {unique_key} ذخیره شد")
-        except Exception as e:
-            logging.error(f"❌ خطا در ارسال به ادمین: {e}")
+        await update.message.reply_text(
+            f"📦 **فایل جدید ذخیره شد!**\n\n"
+            f"📁 نوع: {file_type}\n"
+            f"🔑 کد ثابت: `{unique_key}`\n"
+            f"📝 عنوان: {title}\n"
+            f"🔗 لینک همیشگی:\n`{permanent_link}`\n\n"
+            f"💡 این لینک همیشگی است و منقضی نمی‌شود",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📬 اشتراک‌گذاری لینک", url=permanent_link)
+            ]])
+        )
+        logging.info(f"✅ فایل جدید با کد ثابت {unique_key} ذخیره شد")
+    else:
+        await update.message.reply_text("❌ خطا در ذخیره فایل. لطفاً دوباره تلاش کنید.")
 
 # ==================== دستورات ادمین ====================
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,6 +501,10 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
+    await admin_stats_callback(update, context)
+
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تابع مشترک برای نمایش آمار ادمین"""
     # جمع‌آوری آمار کامل
     videos = db.get_all_videos()
     
@@ -452,7 +519,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     stats_text += f"👁️ **تعداد کل بازدیدها:** {total_views}"
     
-    await update.message.reply_text(stats_text, parse_mode='Markdown')
+    # اگر از کال‌بک استفاده می‌شود
+    if hasattr(update, 'callback_query') and update.callback_query:
+        await update.callback_query.edit_message_text(stats_text, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
 
 async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """لیست تمام ویدیوها با لینک‌های ثابت"""
@@ -468,7 +539,7 @@ async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 هیچ فایلی در دیتابیس وجود ندارد.")
         return
     
-    message_text = "📋 **لیست فایل‌ها با لینک‌های ثابت:**\n\n"
+    message_text = "📋 **لیست فایل‌ها با لینک‌های همیشگی:**\n\n"
     
     for i, (unique_key, title, view_count) in enumerate(videos, 1):
         permanent_link = f"https://t.me/{BOT_USERNAME}?start=video_{unique_key}"
@@ -484,33 +555,42 @@ async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(message_text, parse_mode='Markdown')
 
-async def manual_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور برای تأیید دستی کاربر"""
+async def delete_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف فایل از دیتابیس"""
     user_id = update.effective_user.id
     
     if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
         return
     
     if not context.args:
-        await update.message.reply_text("لطفاً ID کاربر را وارد کنید: /approve <user_id>")
+        await update.message.reply_text("لطفاً کد فایل را وارد کنید: /delete <video_key>")
         return
     
-    try:
-        target_user_id = int(context.args[0])
-        
-        # ارسال پیام تأیید
-        await context.bot.send_message(
-            target_user_id,
-            "✅ دسترسی شما توسط ادمین تأیید شد!\n\n"
-            "اکنون می‌توانید از لینک‌های فایل استفاده کنید."
-        )
-        
-        await update.message.reply_text(f"✅ کاربر {target_user_id} تأیید شد.")
-        
-    except ValueError:
-        await update.message.reply_text("❌ ID کاربر نامعتبر است.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در ارسال پیام: {e}")
+    video_key = context.args[0]
+    
+    # غیرفعال کردن فایل (به جای حذف کامل)
+    db.deactivate_video(video_key)
+    
+    await update.message.reply_text(f"✅ فایل با کد `{video_key}` غیرفعال شد.", parse_mode='Markdown')
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ارسال پیام به همه کاربران"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ این دستور فقط برای ادمین است.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("لطفاً پیام را وارد کنید: /broadcast <پیام>")
+        return
+    
+    broadcast_message = ' '.join(context.args)
+    
+    # این بخش نیاز به پیاده‌سازی جدول users دارد
+    # فعلاً فقط پیام تایید ارسال می‌شود
+    await update.message.reply_text("✅ پیام برای ارسال به کاربران آماده است.")
 
 # ==================== اجرای ربات ====================
 def main():
@@ -522,6 +602,7 @@ def main():
     logging.info("🚀 شروع ربات...")
     logging.info(f"📢 کانال ID: {FORCE_CHANNEL_ID}")
     logging.info(f"🔗 لینک کانال: {FORCE_CHANNEL_LINK}")
+    logging.info(f"🤖 نام ربات: {BOT_USERNAME}")
     
     app = Application.builder().token(TOKEN).build()
     
@@ -529,13 +610,15 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("list", list_videos))
-    app.add_handler(CommandHandler("approve", manual_approve_cmd))
+    app.add_handler(CommandHandler("delete", delete_video))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("upload", handle_private_upload))
     app.add_handler(CallbackQueryHandler(button_handler))
     
-    # هندلر پست‌های کانال
+    # هندلر آپلود فایل در چت خصوصی
     app.add_handler(MessageHandler(
-        filters.ChatType.CHANNEL & (filters.VIDEO | filters.Document.ALL), 
-        handle_channel_post
+        filters.ChatType.PRIVATE & (filters.VIDEO | filters.Document.ALL), 
+        handle_private_upload
     ))
     
     # Job Queue برای حذف خودکار پیام‌های قدیمی
