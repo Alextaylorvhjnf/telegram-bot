@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from telegram.error import BadRequest
 
 # ==================== تنظیمات ====================
-TOKEN = "8519774430:AAGHPewxXjkmj3fMmjjtMMlb3GD2oXGFR-0"
+TOKEN = "8519774430:AAG-E3bs-jswXYYhpkohnHyhbh_KjoRETh0"
 BOT_USERNAME = "Senderpfilesbot"
 
 # تنظیمات کانال
